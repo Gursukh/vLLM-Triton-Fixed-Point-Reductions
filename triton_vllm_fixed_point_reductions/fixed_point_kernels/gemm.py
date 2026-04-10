@@ -10,7 +10,7 @@ from triton_vllm_fixed_point_reductions.fixed_point_kernels.fixed_point import (
 # Temporary constant to for testing.
 # These params will be defered to user input in future.
 TEMP_FRACTIONAL_BITS: tl.constexpr = tl.constexpr(16)
-TEMP_ACCUM_DTYPE: tl.constexpr = tl.int64
+TEMP_ACCUM_DTYPE: tl.constexpr = tl.int32
 
 
 @triton.jit
