@@ -1,6 +1,6 @@
 import pytest
 import torch
-from tests.triton_kernels.fixed_point_helpers import f2x, requires_cuda, x2f
+from tests.fixed_point_helpers import f2x, requires_cuda, x2f
 
 
 @requires_cuda

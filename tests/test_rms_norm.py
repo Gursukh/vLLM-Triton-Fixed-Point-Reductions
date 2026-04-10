@@ -3,8 +3,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tests.triton_kernels.fixed_point_helpers import requires_cuda
-from triton_vllm_fixed_point_reductions.triton_kernels import rmsnorm_kernel
+from tests.fixed_point_helpers import requires_cuda
+from triton_vllm_fixed_point_reductions.fixed_point_kernels import rms_norm
 
 
 @triton.jit
@@ -39,13 +39,13 @@ def _run_rms_norm_kernel(
     assert x.shape[1] == w.shape[0]
 
     # The kernel references a module-level scale constant.
-    rmsnorm_kernel.scale = float(1 << 16)
+    rms_norm.scale = float(1 << 16)
 
     batch, hidden = x.shape
     y = torch.empty_like(x)
     block = triton.next_power_of_2(max(hidden, 1))
 
-    rmsnorm_kernel.rms_norm_fp_kernel[(batch,)](
+    rms_norm.rms_norm_fp_kernel[(batch,)](
         x,
         w,
         y,

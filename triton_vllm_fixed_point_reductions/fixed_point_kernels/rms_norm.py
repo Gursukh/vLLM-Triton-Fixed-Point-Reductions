@@ -1,7 +1,7 @@
 import triton
 import triton.language as tl
 
-from triton_vllm_fixed_point_reductions.triton_kernels.fixed_point_kernel import (
+from triton_vllm_fixed_point_reductions.fixed_point_kernels.fixed_point import (
     float_to_fixed,
     fixed_to_float,
 )
