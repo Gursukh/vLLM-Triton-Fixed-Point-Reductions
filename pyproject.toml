@@ -1,0 +1,20 @@
+[project]
+name = "det-vllm"
+version = "0.1.0"
+description = "Deterministic inference for vLLM via fixed-point reductions"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "vllm",
+    "triton",
+    "torch",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"

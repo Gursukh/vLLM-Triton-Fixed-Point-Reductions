@@ -1,0 +1,53 @@
+import pytest
+import torch
+import triton
+import triton.language as tl
+
+from triton_vllm_fixed_point_reductions.triton_kernels.fixed_point_kernel import float_to_fixed, fixed_to_float
+
+
+@triton.jit
+def _f2x_kernel(x_ptr, y_ptr, n, frac_bits: tl.constexpr, BLOCK: tl.constexpr, OUT: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask)
+    y = float_to_fixed(x, frac_bits, dtype=OUT)
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+@triton.jit
+def _x2f_kernel(x_ptr, y_ptr, n, frac_bits: tl.constexpr, BLOCK: tl.constexpr, OUT: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask)
+    y = fixed_to_float(x, frac_bits, dtype=OUT)
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+_TL = {
+    torch.int16: tl.int16,
+    torch.int32: tl.int32,
+    torch.int64: tl.int64,
+    torch.float16: tl.float16,
+    torch.float32: tl.float32,
+    torch.float64: tl.float64,
+}
+
+
+def f2x(x: torch.Tensor, frac_bits: tl.constexpr, out: torch.dtype) -> torch.Tensor:
+    n = x.numel()
+    block = triton.next_power_of_2(max(n, 1))
+    y = torch.empty(n, device=x.device, dtype=out)
+    _f2x_kernel[(1,)](x.contiguous(), y, n, frac_bits, BLOCK=block, OUT=_TL[out])
+    return y.view_as(x)
+
+
+def x2f(x: torch.Tensor, frac_bits: tl.constexpr, out: torch.dtype) -> torch.Tensor:
+    n = x.numel()
+    block = triton.next_power_of_2(max(n, 1))
+    y = torch.empty(n, device=x.device, dtype=out)
+    _x2f_kernel[(1,)](x.contiguous(), y, n, frac_bits, BLOCK=block, OUT=_TL[out])
+    return y.view_as(x)
+
+
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
