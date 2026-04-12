@@ -73,11 +73,11 @@ def gemm_fp_kernel(
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-        # Convert the floating point values to fixed point representation
-        # (integers) before multiplication.
-        a_int = float_to_fixed(a, TEMP_FRACTIONAL_BITS, dtype=TEMP_ACCUM_DTYPE)
-        b_int = float_to_fixed(b, TEMP_FRACTIONAL_BITS, dtype=TEMP_ACCUM_DTYPE)
-        accumulator = tl.sum(a_int[:, :, None] * b_int[None, :, :], axis=1)
+        # First multiple as floats to avoid overflow, then convert to 
+        # fixed point before accumulation.
+        ab = a[:, :, None] * b[None, :, : ]
+        ab_int = float_to_fixed(ab, TEMP_FRACTIONAL_BITS, TEMP_ACCUM_DTYPE)
+        accumulator = tl.sum(ab_int, axis=1)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -85,7 +85,7 @@ def gemm_fp_kernel(
 
     # We must multiply TEMP_FRACTIONAL_BITS by 2 as when we do a * b the scale
     # factor becomes 4
-    c = fixed_to_float(accumulator, 2 * TEMP_FRACTIONAL_BITS, dtype=tl.float32)
+    c = fixed_to_float(accumulator, TEMP_FRACTIONAL_BITS, dtype=tl.float32)
 
     # Write back the block of the output matrix C with masks.
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)

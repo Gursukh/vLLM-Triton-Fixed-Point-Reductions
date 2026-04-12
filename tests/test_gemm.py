@@ -69,12 +69,8 @@ def test_gemm_fixed_point_correctness(M, N, K):
     """Fixed-point GEMM should closely match a plain float Triton GEMM."""
     g = torch.Generator(device="cuda").manual_seed(42)
 
-    a = (
-        torch.rand((M, K), device="cuda", dtype=torch.float32, generator=g) - 0.5
-    ) * 4.0
-    b = (
-        torch.rand((K, N), device="cuda", dtype=torch.float32, generator=g) - 0.5
-    ) * 4.0
+    a = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g)
+    b = torch.randn((K, N), device="cuda", dtype=torch.float32, generator=g)
 
     got = _run_gemm_fp_kernel(a, b)
     ref = torch.matmul(a, b)
@@ -89,12 +85,8 @@ def test_gemm_matches_torch():
     """Fixed-point GEMM should closely match torch.matmul."""
     g = torch.Generator(device="cuda").manual_seed(7)
 
-    a = (
-        torch.rand((8, 16), device="cuda", dtype=torch.float32, generator=g) - 0.5
-    ) * 4.0
-    b = (
-        torch.rand((16, 8), device="cuda", dtype=torch.float32, generator=g) - 0.5
-    ) * 4.0
+    a = torch.randn((8, 16), device="cuda", dtype=torch.float32, generator=g)
+    b = torch.randn((16, 8), device="cuda", dtype=torch.float32, generator=g)
 
     got = _run_gemm_fp_kernel(a, b)
     ref = torch.matmul(a, b)
@@ -109,9 +101,7 @@ def test_gemm_identity():
     """A @ I = A."""
     K = 16
     g = torch.Generator(device="cuda").manual_seed(0)
-    a = (
-        torch.rand((4, K), device="cuda", dtype=torch.float32, generator=g) - 0.5
-    ) * 4.0
+    a = torch.randn((4, K), device="cuda", dtype=torch.float32, generator=g)
     eye = torch.eye(K, device="cuda", dtype=torch.float32)
 
     got = _run_gemm_fp_kernel(a, eye)
@@ -132,8 +122,8 @@ def test_gemm_zero_matrix():
 def test_gemm_single_row_col():
     """(1,16) @ (16,1) single-element output."""
     g = torch.Generator(device="cuda").manual_seed(0)
-    a = torch.rand((1, 16), device="cuda", dtype=torch.float32, generator=g)
-    b = torch.rand((16, 1), device="cuda", dtype=torch.float32, generator=g)
+    a = torch.randn((1, 16), device="cuda", dtype=torch.float32, generator=g)
+    b = torch.randn((16, 1), device="cuda", dtype=torch.float32, generator=g)
 
     got = _run_gemm_fp_kernel(a, b)
     ref = torch.matmul(a, b)
@@ -144,8 +134,8 @@ def test_gemm_single_row_col():
 def test_gemm_non_square():
     """Non-square dimensions: (2,16) @ (16,3) -> (2,3)."""
     g = torch.Generator(device="cuda").manual_seed(99)
-    a = torch.rand((2, 16), device="cuda", dtype=torch.float32, generator=g)
-    b = torch.rand((16, 3), device="cuda", dtype=torch.float32, generator=g)
+    a = torch.randn((2, 16), device="cuda", dtype=torch.float32, generator=g)
+    b = torch.randn((16, 3), device="cuda", dtype=torch.float32, generator=g)
 
     got = _run_gemm_fp_kernel(a, b)
     ref = torch.matmul(a, b)
@@ -202,12 +192,8 @@ def test_gemm_element_permutation_invariance():
     g = torch.Generator(device="cuda").manual_seed(123)
 
     M, K, N = 4, 32, 4
-    a = (
-        torch.rand((M, K), device="cuda", dtype=torch.float32, generator=g) - 0.5
-    ) * 32.0
-    b = (
-        torch.rand((K, N), device="cuda", dtype=torch.float32, generator=g) - 0.5
-    ) * 32.0
+    a = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g)
+    b = torch.randn((K, N), device="cuda", dtype=torch.float32, generator=g)
 
     perm = torch.randperm(K, device="cuda")
     a_perm = a[:, perm]
@@ -225,12 +211,8 @@ def test_gemm_element_permutation_invariance():
 def test_gemm_deterministic_across_runs():
     """The same inputs must always produce bitwise identical outputs."""
     g = torch.Generator(device="cuda").manual_seed(77)
-    a = (
-        torch.rand((8, 32), device="cuda", dtype=torch.float32, generator=g) - 0.5
-    ) * 16.0
-    b = (
-        torch.rand((32, 8), device="cuda", dtype=torch.float32, generator=g) - 0.5
-    ) * 16.0
+    a = torch.randn((8, 32), device="cuda", dtype=torch.float32, generator=g)
+    b = torch.randn((32, 8), device="cuda", dtype=torch.float32, generator=g)
 
     results = [_run_gemm_fp_kernel(a, b) for _ in range(5)]
     for r in results[1:]:
