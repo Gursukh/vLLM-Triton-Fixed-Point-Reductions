@@ -6,11 +6,58 @@ from triton_vllm_fixed_point_reductions.fixed_point_kernels.fixed_point import (
     fixed_to_float,
 )
 
-
-# Temporary constant to for testing.
-# These params will be defered to user input in future.
+# Temporary constant for testing.
+# These params will be deferred to user input in future.
 TEMP_FRACTIONAL_BITS: tl.constexpr = tl.constexpr(16)
-TEMP_ACCUM_DTYPE: tl.constexpr = tl.int32
+
+@triton.jit
+def fp_gemm(
+    a_row_ptrs,
+    b_col_ptrs,
+    stride_a_k,
+    stride_b_k,
+    row_mask,
+    col_mask,
+    Lk,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+    K: tl.constexpr,          
+    D_CHUNK: tl.constexpr,    
+    FRAC_BITS: tl.constexpr,
+    RETURN_FXP: tl.constexpr = False,
+):
+    acc = tl.zeros([ROWS, COLS], dtype=tl.int32)
+
+    for k_start in tl.static_range(0, K, D_CHUNK):
+        k_offs = k_start + tl.arange(0, D_CHUNK)
+        k_valid = k_offs < Lk
+
+        a = tl.load(
+            a_row_ptrs[:, None] + k_offs[None, :] * stride_a_k,
+            mask=row_mask[:, None] & k_valid[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        b = tl.load(
+            b_col_ptrs[None, :] + k_offs[:, None] * stride_b_k,
+            mask=k_valid[:, None] & col_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        prod = a[:, :, None] * b[None, :, :]
+        acc += tl.sum(float_to_fixed(prod, FRAC_BITS, tl.int32), axis=1)
+
+    if RETURN_FXP:
+        return acc
+    return fixed_to_float(acc, FRAC_BITS, tl.float32)
+
+
+@triton.jit
+def fp_dot_chunk(a, b, FRAC_BITS: tl.constexpr):
+    prod = a[:, :, None] * b[None, :, :]
+    return tl.sum(float_to_fixed(prod, FRAC_BITS, tl.int32), axis=1)
+
+
 
 
 @triton.jit
@@ -31,9 +78,6 @@ def gemm_fp_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
-    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
-    """
 
     GROUP_SIZE_M: tl.constexpr = 8
 
@@ -47,11 +91,6 @@ def gemm_fp_kernel(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    
-    # Add some integer bound assumptions.
-    # This helps to guide integer analysis in the backend to optimize
-    # load/store offset address calculation
-    # from triton tutorial
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
     tl.assume(stride_am > 0)
@@ -61,35 +100,30 @@ def gemm_fp_kernel(
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    row_mask = offs_m < M
+    col_mask = offs_n < N
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=TEMP_ACCUM_DTYPE)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    a_row_ptrs = a_ptr + offs_m * stride_am
+    b_col_ptrs = b_ptr + offs_n * stride_bn
 
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-
-        # First multiple as floats to avoid overflow, then convert to 
-        # fixed point before accumulation.
-        ab = a[:, :, None] * b[None, :, : ]
-        ab_int = float_to_fixed(ab, TEMP_FRACTIONAL_BITS, TEMP_ACCUM_DTYPE)
-        accumulator = tl.sum(ab_int, axis=1)
-
-        # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-
-    # We must multiply TEMP_FRACTIONAL_BITS by 2 as when we do a * b the scale
-    # factor becomes 4
-    c = fixed_to_float(accumulator, TEMP_FRACTIONAL_BITS, dtype=tl.float32)
+    c = fp_gemm(
+        a_row_ptrs,
+        b_col_ptrs,
+        stride_a_k=stride_ak,
+        stride_b_k=stride_bk,
+        row_mask=row_mask,
+        col_mask=col_mask,
+        Lk=K,
+        ROWS=BLOCK_SIZE_M,
+        COLS=BLOCK_SIZE_N,
+        K=BLOCK_SIZE_K,
+        D_CHUNK=BLOCK_SIZE_K,
+        FRAC_BITS=TEMP_FRACTIONAL_BITS,
+    )
 
     # Write back the block of the output matrix C with masks.
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+    c_mask = row_mask[:, None] & col_mask[None, :]
     tl.store(c_ptrs, c, mask=c_mask)

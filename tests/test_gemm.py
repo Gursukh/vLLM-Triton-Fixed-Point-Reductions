@@ -23,7 +23,7 @@ def _run_gemm_fp_kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     BLOCK_N = triton.next_power_of_2(max(N, 1))
     BLOCK_K = K
 
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
 
     gemm.gemm_fp_kernel[grid](
         a,
