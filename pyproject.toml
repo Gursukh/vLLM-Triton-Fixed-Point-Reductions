@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.entry-points."vllm.general_plugins"]
-fixed_point_reductions = "triton_vllm_fixed_point_reductions.vllm_modules.plugin:register"
+fixed_point_reductions = "vllm_fixed_point_reductions.register:register"
 
 [project.optional-dependencies]
 dev = [
@@ -21,3 +21,10 @@ dev = [
 [build-system]
 requires = ["setuptools>=75.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = [
+    "vllm_fixed_point_reductions",
+    "vllm_fixed_point_reductions.fixed_point_kernels",
+    "vllm_fixed_point_reductions.vllm_modules",
+]
