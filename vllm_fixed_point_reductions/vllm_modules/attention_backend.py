@@ -12,7 +12,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 
-from ..fixed_point_kernels.fixed_point import fxp_tl_dtype
+from ..fixed_point_kernels.fixed_point import fixed_tl_dtype
 from ..fixed_point_kernels.prefill import context_attention_fwd_fxp_paged
 from ..fixed_point_kernels.decode import decode_attention_fwd_fp_kernel
 from .config import get_runtime_config
@@ -115,7 +115,7 @@ class DeterministicAttentionImpl(AttentionImpl):
         self.attn_type = attn_type
         self.frac_bits = cfg.frac_bits
         self.num_kv_splits = cfg.num_kv_splits
-        self.fxp_dtype = fxp_tl_dtype(cfg.fxp_int_bits)
+        self.fxp_dtype = fixed_tl_dtype(cfg.fxp_int_bits)
 
     def forward(
         self,

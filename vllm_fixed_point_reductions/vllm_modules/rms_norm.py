@@ -6,7 +6,7 @@ import triton
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.layernorm import RMSNorm
 
-from ..fixed_point_kernels.fixed_point import fxp_tl_dtype
+from ..fixed_point_kernels.fixed_point import fixed_tl_dtype
 from ..fixed_point_kernels.rms_norm import rms_norm_fxp_kernel
 from .config import get_runtime_config
 
@@ -60,7 +60,7 @@ class DeterministicRMSNorm(RMSNorm):
         weight = self._get_weight_fp32()
         cfg = get_runtime_config()
         frac_bits = cfg.frac_bits
-        fxp_dtype = fxp_tl_dtype(cfg.fxp_int_bits)
+        fxp_dtype = fixed_tl_dtype(cfg.fxp_int_bits)
 
         if residual is not None:
             new_residual = x.to(torch.float32) + residual.to(torch.float32)

@@ -23,16 +23,12 @@ def _register_rms_norm() -> None:
     original_rms_norm = layernorm_mod.RMSNorm
     layernorm_mod.RMSNorm = DeterministicRMSNorm
 
-    patched_modules = 0
     for mod_name, mod in list(sys.modules.items()):
         if mod is None or not mod_name.startswith("vllm.model_executor.models."):
             continue
 
         if getattr(mod, "RMSNorm", None) is original_rms_norm:
             setattr(mod, "RMSNorm", DeterministicRMSNorm)
-            patched_modules += 1
-
-    logger.info("RMSNorm patched (preloaded_model_modules=%d)", patched_modules)
 
 
 def _register_quant_config() -> None:
@@ -40,7 +36,8 @@ def _register_quant_config() -> None:
 
     from .vllm_modules.quantisation_config import FixedPointConfig
 
-    logger.info("Quant config registered: %s", FixedPointConfig.get_name())
+    # Force registration of the config class by calling a method on it.
+    FixedPointConfig.get_name()
 
 
 def _register_attention_backend() -> None:
@@ -62,12 +59,6 @@ def _register_attention_backend() -> None:
         class_path=backend_path,
     )
 
-    logger.info(
-        "Attention backend registered under CUSTOM (%s). "
-        "Activate with VLLM_ATTENTION_BACKEND=CUSTOM.",
-        backend_path,
-    )
-
 
 def _register_sampler() -> None:
     """Patch the Sampler class to use the deterministic log-softmax implementation."""
@@ -84,6 +75,7 @@ def _register_sampler() -> None:
 
 
 def register() -> None:
+    """Register all components for the fixed-point reductions in vLLM."""
 
     global _registered
     if _registered:
@@ -94,13 +86,24 @@ def register() -> None:
 
     cfg = get_runtime_config()
     logger.info(
-        "  frac_bits=%d num_kv_splits=%d fxp_int_bits=%d",
+        "Runtime Config: frac_bits=%d num_kv_splits=%d fxp_int_bits=%d",
         cfg.frac_bits,
         cfg.num_kv_splits,
         cfg.fxp_int_bits,
     )
 
-    _register_rms_norm()
-    _register_quant_config()
-    _register_attention_backend()
-    _register_sampler()
+    try:
+        _register_rms_norm()
+        logger.info("RMSNorm registered")
+
+        _register_quant_config()
+        logger.info("Quant config registered")
+
+        _register_attention_backend()
+        logger.info("Attention backend registered")
+
+        _register_sampler()
+        logger.info("Sampler registered")
+    except Exception as e:
+        logger.error("Error during registration: %s", e)
+        raise

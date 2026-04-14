@@ -14,7 +14,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.layers.quantization import register_quantization_config
 
-from ..fixed_point_kernels.fixed_point import fxp_tl_dtype
+from ..fixed_point_kernels.fixed_point import fixed_tl_dtype
 from ..fixed_point_kernels.gemm import launch_gemm_fxp
 from .config import DEFAULT_FRAC_BITS, get_runtime_config
 
@@ -110,7 +110,7 @@ class FixedPointLinearMethod(QuantizeMethodBase):
         if w_t is None:
             w_t = layer.weight.data.to(torch.float32).t().contiguous()
 
-        fxp_dtype = fxp_tl_dtype(get_runtime_config().fxp_int_bits)
+        fxp_dtype = fixed_tl_dtype(get_runtime_config().fxp_int_bits)
         out = launch_gemm_fxp(
             x2d, w_t, frac_bits=self.config.frac_bits, fxp_dtype=fxp_dtype
         )
