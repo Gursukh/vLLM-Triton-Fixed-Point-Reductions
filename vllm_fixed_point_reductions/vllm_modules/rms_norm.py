@@ -8,7 +8,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 
 from ..fixed_point_kernels.fixed_point import fxp_tl_dtype
 from ..fixed_point_kernels.rms_norm import rms_norm_fxp_kernel
-from ..register import get_runtime_config
+from .config import get_runtime_config
 
 logger = logging.getLogger("vllm_deterministic")
 

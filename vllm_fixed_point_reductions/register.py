@@ -1,69 +1,16 @@
 import logging
-import os
 import sys
-from dataclasses import dataclass
 
-
-DEFAULT_FRAC_BITS = 16
-DEFAULT_NUM_KV_SPLITS = 8
-DEFAULT_FXP_INT_BITS = 32
+from .vllm_modules.config import get_runtime_config
 
 logger = logging.getLogger("vllm_fixed_point_reductions")
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("Ignoring malformed %s=%r; using default %d", name, raw, default)
-        return default
-
-
-@dataclass(frozen=True)
-class FxpRuntimeConfig:
-    frac_bits: int = DEFAULT_FRAC_BITS
-    num_kv_splits: int = DEFAULT_NUM_KV_SPLITS
-    fxp_int_bits: int = DEFAULT_FXP_INT_BITS
-
-
-def load_runtime_config() -> FxpRuntimeConfig:
-    int_bits = _env_int("VLLM_FXP_INT_BITS", DEFAULT_FXP_INT_BITS)
-    if int_bits not in (16, 32, 64):
-        logger.warning(
-            "Invalid VLLM_FXP_INT_BITS=%d; must be 16/32/64. Using default %d.",
-            int_bits,
-            DEFAULT_FXP_INT_BITS,
-        )
-        int_bits = DEFAULT_FXP_INT_BITS
-    return FxpRuntimeConfig(
-        frac_bits=_env_int("VLLM_FXP_FRAC_BITS", DEFAULT_FRAC_BITS),
-        num_kv_splits=_env_int("VLLM_FXP_NUM_KV_SPLITS", DEFAULT_NUM_KV_SPLITS),
-        fxp_int_bits=int_bits,
-    )
-
-
-_runtime_config: FxpRuntimeConfig | None = None
-
-
-def get_runtime_config() -> FxpRuntimeConfig:
-    global _runtime_config
-    if _runtime_config is None:
-        _runtime_config = load_runtime_config()
-    return _runtime_config
-
-
-def set_runtime_config(cfg: FxpRuntimeConfig) -> None:
-    global _runtime_config
-    _runtime_config = cfg
 
 
 _registered = False
 
 
 def _register_rms_norm() -> None:
+    """Register the deterministic RMSNorm implementation, replacing the default one."""
 
     from vllm.model_executor.custom_op import op_registry
     import vllm.model_executor.layers.layernorm as layernorm_mod
@@ -71,7 +18,7 @@ def _register_rms_norm() -> None:
     if "rms_norm" in op_registry:
         del op_registry["rms_norm"]
 
-    from .vllm_modules.rms_norm_fxp import DeterministicRMSNorm
+    from .vllm_modules.rms_norm import DeterministicRMSNorm
 
     original_rms_norm = layernorm_mod.RMSNorm
     layernorm_mod.RMSNorm = DeterministicRMSNorm
@@ -80,6 +27,7 @@ def _register_rms_norm() -> None:
     for mod_name, mod in list(sys.modules.items()):
         if mod is None or not mod_name.startswith("vllm.model_executor.models."):
             continue
+
         if getattr(mod, "RMSNorm", None) is original_rms_norm:
             setattr(mod, "RMSNorm", DeterministicRMSNorm)
             patched_modules += 1
@@ -88,6 +36,7 @@ def _register_rms_norm() -> None:
 
 
 def _register_quant_config() -> None:
+    """Register the quantisation config for the fixed-point reductions in gemms."""
 
     from .vllm_modules.quantisation_config import FixedPointConfig
 
@@ -95,11 +44,12 @@ def _register_quant_config() -> None:
 
 
 def _register_attention_backend() -> None:
+    """Register the deterministic attention backend, replacing the "CUSTOM" backend enum."""
+
     from vllm.v1.attention.backends.registry import (
         AttentionBackendEnum,
         register_backend,
     )
-
     from .vllm_modules.attention_backend import DeterministicAttentionBackend
 
     backend_path = (
@@ -111,6 +61,7 @@ def _register_attention_backend() -> None:
         AttentionBackendEnum.CUSTOM,
         class_path=backend_path,
     )
+
     logger.info(
         "Attention backend registered under CUSTOM (%s). "
         "Activate with VLLM_ATTENTION_BACKEND=CUSTOM.",
@@ -119,18 +70,15 @@ def _register_attention_backend() -> None:
 
 
 def _register_sampler() -> None:
-    import torch
-    from vllm.v1.sample.sampler import Sampler
+    """Patch the Sampler class to use the deterministic log-softmax implementation."""
 
+    from vllm.v1.sample.sampler import Sampler
     from .vllm_modules.sampling import deterministic_log_softmax
 
     if getattr(Sampler, "_fxp_logprobs_patched", False):
         return
 
-    def _det_compute_logprobs(logits: torch.Tensor) -> torch.Tensor:
-        return deterministic_log_softmax(logits.to(torch.float32), dim=-1)
-
-    Sampler.compute_logprobs = staticmethod(_det_compute_logprobs)
+    Sampler.compute_logprobs = staticmethod(deterministic_log_softmax)
     Sampler._fxp_logprobs_patched = True
     logger.info("Sampler log-softmax patched")
 

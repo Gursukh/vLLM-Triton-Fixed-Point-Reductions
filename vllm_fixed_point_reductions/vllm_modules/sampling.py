@@ -2,7 +2,7 @@ import torch
 
 from ..fixed_point_kernels.fixed_point import fxp_tl_dtype
 from ..fixed_point_kernels.softmax import log_softmax_fxp
-from ..register import get_runtime_config
+from .config import get_runtime_config
 
 
 def deterministic_log_softmax(

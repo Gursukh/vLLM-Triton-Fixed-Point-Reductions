@@ -15,7 +15,7 @@ from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 from ..fixed_point_kernels.fixed_point import fxp_tl_dtype
 from ..fixed_point_kernels.prefill import context_attention_fwd_fxp_paged
 from ..fixed_point_kernels.decode import decode_attention_fwd_fp_kernel
-from ..register import get_runtime_config
+from .config import get_runtime_config
 
 logger = logging.getLogger("vllm_fixed_point_reductions")
 
