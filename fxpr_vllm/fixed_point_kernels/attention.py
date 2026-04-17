@@ -362,8 +362,6 @@ def unified_attention_fxp_kernel(
     block_table,
     output,
     alibi_slopes_ptr,
-    q_block_to_req,
-    q_block_local,
     stride_query_seq,
     stride_query_head,
     stride_key_cache_block,
@@ -388,11 +386,9 @@ def unified_attention_fxp_kernel(
     FIXED_POINT_DTYPE: tl.constexpr,
 ):
     """Unified prefill+decode attention over a paged KV cache."""
-    global_q_block = tl.program_id(0)
-    head_index = tl.program_id(1)
-
-    request_index = tl.load(q_block_to_req + global_q_block)
-    query_block_index = tl.load(q_block_local + global_q_block)
+    request_index = tl.program_id(0)
+    query_block_index = tl.program_id(1)
+    head_index = tl.program_id(2)
 
     kv_head_index = head_index // kv_group_size
 
@@ -403,6 +399,8 @@ def unified_attention_fxp_kernel(
     current_context_length = current_sequence_length - current_query_length
 
     query_block_start = QUERY_BLOCK_SIZE * query_block_index
+    if query_block_start >= current_query_length:
+        return
 
     query_offsets = query_block_start + tl.arange(0, QUERY_BLOCK_SIZE)
     head_dim_offsets = tl.arange(0, HEAD_DIM_PADDED)
@@ -472,6 +470,7 @@ def unified_attention_fxp(
     query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
+    max_query_len: int,
     *,
     alibi_slopes: torch.Tensor | None = None,
     fxp_dtype=tl.int32,
@@ -511,24 +510,11 @@ def unified_attention_fxp(
     kv_group_size = num_heads // num_kv_heads
     page_size = key_cache.shape[1]
 
-    query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    blocks_per_req = (query_lens + (query_block_size - 1)) // query_block_size
-    total_q_blocks = int(blocks_per_req.sum().item())
-    if total_q_blocks == 0:
+    max_q_blocks = (max_query_len + query_block_size - 1) // query_block_size
+    if num_requests == 0 or max_q_blocks == 0:
         return
 
-    device = q.device
-    q_block_to_req = torch.repeat_interleave(
-        torch.arange(num_requests, device=device, dtype=torch.int32),
-        blocks_per_req,
-    )
-    cu_blocks = torch.zeros(num_requests + 1, device=device, dtype=torch.int32)
-    torch.cumsum(blocks_per_req, 0, out=cu_blocks[1:])
-    q_block_local = torch.arange(
-        total_q_blocks, device=device, dtype=torch.int32
-    ) - cu_blocks[:-1].index_select(0, q_block_to_req.to(torch.int64))
-
-    grid = (total_q_blocks, num_heads)
+    grid = (num_requests, max_q_blocks, num_heads)
 
     unified_attention_fxp_kernel[grid](
         Q=q,
@@ -540,8 +526,6 @@ def unified_attention_fxp(
         block_table=block_table,
         output=o,
         alibi_slopes_ptr=alibi_slopes_scaled,
-        q_block_to_req=q_block_to_req,
-        q_block_local=q_block_local,
         stride_query_seq=q.stride(0),
         stride_query_head=q.stride(1),
         stride_key_cache_block=key_cache.stride(0),

@@ -159,6 +159,7 @@ class DeterministicAttentionImpl(AttentionImpl):
         query_start_loc = attn_metadata.query_start_loc.to(torch.int32)
         seq_lens = attn_metadata.seq_lens.to(torch.int32)
         block_table = attn_metadata.block_table
+        max_query_len = int(attn_metadata.max_query_len)
 
         q32 = _to_fp32(query)
         o32 = torch.empty_like(q32)
@@ -170,6 +171,7 @@ class DeterministicAttentionImpl(AttentionImpl):
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
             block_table=block_table,
+            max_query_len=max_query_len,
             alibi_slopes=self.alibi_slopes,
             is_causal=True,
             softmax_scale=self.scale,
