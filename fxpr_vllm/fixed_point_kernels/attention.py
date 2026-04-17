@@ -16,25 +16,27 @@ def prepare_log2_softmax_scale(head_dim, softmax_scale=None):
 
 
 @triton.jit
-def _attention_pass(
+def attention_fwd_fxp_body(
+    output,
+    softmax_scale,
     query_row_pointers,
     query_row_mask,
     causal_row_positions,
+    output_row_base,
     key_end_position,
+    query_offsets,
     head_dim_offsets,
     head_dim_mask,
     kv_head_index,
     head_index,
-    softmax_scale,
-    running_row_max,
-    softmax_denominator_fxp,
-    output_accumulator_fxp,
+    stride_output_seq,
+    stride_output_head,
     alibi_slopes_ptr,
-    PASS: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     QUERY_BLOCK_SIZE: tl.constexpr,
     KEY_BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM_PADDED: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     HEAD_DIM_CHUNK: tl.constexpr,
     FRACTIONAL_BITS: tl.constexpr,
@@ -69,6 +71,10 @@ def _attention_pass(
     else:
         alibi_slope = 0.0
 
+    running_row_max = tl.zeros([QUERY_BLOCK_SIZE], dtype=tl.float32) - float("inf")
+
+    # Pass 1: softmax max. Kept separate from pass 2 to avoid the
+    # nondeterminism of online softmax.
     for key_block_start in range(0, key_end_position, KEY_BLOCK_SIZE):
         key_block_start = tl.multiple_of(key_block_start, KEY_BLOCK_SIZE)
         key_positions = key_block_start + key_offsets
@@ -138,193 +144,118 @@ def _attention_pass(
             )
         qk = tl.where(score_mask, qk, float("-inf"))
 
-        if PASS == 1:
-            running_row_max = tl.maximum(running_row_max, tl.max(qk, 1))
-        else:
-            if IS_PAGED:
-                value_pointers = (
-                    V_cache
-                    + physical_block_index[:, None] * stride_value_cache_block
-                    + in_block_offset[:, None] * stride_value_cache_slot
-                    + kv_head_index * stride_value_cache_head
-                    + head_dim_offsets[None, :]
-                )
-            else:
-                value_pointers = (
-                    V
-                    + kv_head_index * stride_value_head
-                    + (batch_token_start + key_positions[:, None]) * stride_value_seq
-                    + head_dim_offsets[None, :]
-                )
+        running_row_max = tl.maximum(running_row_max, tl.max(qk, 1))
 
-            attention_weights = tl.math.exp2(qk - running_row_max[:, None])
-            attention_weights_fxp = float_to_fixed(
-                x=attention_weights,
-                fractional_bit_width=FRACTIONAL_BITS,
-                fixed_point_type=FIXED_POINT_DTYPE,
-            )
-            softmax_denominator_fxp += tl.sum(attention_weights_fxp, axis=1)
-
-            value_chunk = tl.load(
-                value_pointers,
-                mask=key_mask[:, None] & head_dim_mask[None, :],
-                other=0.0,
-            ).to(tl.float16)
-            output_accumulator_fxp += dot_chunk_fxp(
-                a=attention_weights,
-                b=value_chunk,
-                FRAC_BITS=FRACTIONAL_BITS,
-                FXP_DTYPE=FIXED_POINT_DTYPE,
-            )
-
-    return running_row_max, softmax_denominator_fxp, output_accumulator_fxp
-
-
-@triton.jit
-def attention_fwd_fxp_body(
-    output,
-    softmax_scale,
-    query_row_pointers,
-    query_row_mask,
-    causal_row_positions,
-    output_row_base,
-    key_end_position,
-    query_offsets,
-    head_dim_offsets,
-    head_dim_mask,
-    kv_head_index,
-    head_index,
-    stride_output_seq,
-    stride_output_head,
-    alibi_slopes_ptr,
-    IS_CAUSAL: tl.constexpr,
-    USE_ALIBI: tl.constexpr,
-    QUERY_BLOCK_SIZE: tl.constexpr,
-    KEY_BLOCK_SIZE: tl.constexpr,
-    HEAD_DIM_PADDED: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    HEAD_DIM_CHUNK: tl.constexpr,
-    FRACTIONAL_BITS: tl.constexpr,
-    FIXED_POINT_DTYPE: tl.constexpr,
-    IS_PAGED: tl.constexpr = False,
-    PAGE_SIZE: tl.constexpr = 1,
-    K=0,
-    stride_key_seq=0,
-    stride_key_head=0,
-    V=0,
-    stride_value_seq=0,
-    stride_value_head=0,
-    batch_token_start=0,
-    K_cache=0,
-    stride_key_cache_block=0,
-    stride_key_cache_slot=0,
-    stride_key_cache_head=0,
-    V_cache=0,
-    stride_value_cache_block=0,
-    stride_value_cache_slot=0,
-    stride_value_cache_head=0,
-    block_table=0,
-    stride_block_table_batch=0,
-    request_index=0,
-):
-    running_row_max = tl.zeros([QUERY_BLOCK_SIZE], dtype=tl.float32) - float("inf")
     softmax_denominator_fxp = tl.zeros([QUERY_BLOCK_SIZE], dtype=FIXED_POINT_DTYPE)
     output_accumulator_fxp = tl.zeros(
         [QUERY_BLOCK_SIZE, HEAD_DIM_PADDED], dtype=FIXED_POINT_DTYPE
     )
 
-    # Pass 1: softmax max. Kept separate from pass 2 to avoid the
-    # nondeterminism of online softmax.
-    running_row_max, softmax_denominator_fxp, output_accumulator_fxp = _attention_pass(
-        query_row_pointers=query_row_pointers,
-        query_row_mask=query_row_mask,
-        causal_row_positions=causal_row_positions,
-        key_end_position=key_end_position,
-        head_dim_offsets=head_dim_offsets,
-        head_dim_mask=head_dim_mask,
-        kv_head_index=kv_head_index,
-        head_index=head_index,
-        softmax_scale=softmax_scale,
-        running_row_max=running_row_max,
-        softmax_denominator_fxp=softmax_denominator_fxp,
-        output_accumulator_fxp=output_accumulator_fxp,
-        alibi_slopes_ptr=alibi_slopes_ptr,
-        PASS=1,
-        IS_CAUSAL=IS_CAUSAL,
-        USE_ALIBI=USE_ALIBI,
-        QUERY_BLOCK_SIZE=QUERY_BLOCK_SIZE,
-        KEY_BLOCK_SIZE=KEY_BLOCK_SIZE,
-        HEAD_DIM=HEAD_DIM,
-        HEAD_DIM_CHUNK=HEAD_DIM_CHUNK,
-        FRACTIONAL_BITS=FRACTIONAL_BITS,
-        FIXED_POINT_DTYPE=FIXED_POINT_DTYPE,
-        IS_PAGED=IS_PAGED,
-        PAGE_SIZE=PAGE_SIZE,
-        K=K,
-        stride_key_seq=stride_key_seq,
-        stride_key_head=stride_key_head,
-        V=V,
-        stride_value_seq=stride_value_seq,
-        stride_value_head=stride_value_head,
-        batch_token_start=batch_token_start,
-        K_cache=K_cache,
-        stride_key_cache_block=stride_key_cache_block,
-        stride_key_cache_slot=stride_key_cache_slot,
-        stride_key_cache_head=stride_key_cache_head,
-        V_cache=V_cache,
-        stride_value_cache_block=stride_value_cache_block,
-        stride_value_cache_slot=stride_value_cache_slot,
-        stride_value_cache_head=stride_value_cache_head,
-        block_table=block_table,
-        stride_block_table_batch=stride_block_table_batch,
-        request_index=request_index,
-    )
-
     # Pass 2: accumulate softmax-weighted V using running_row_max from pass 1.
-    running_row_max, softmax_denominator_fxp, output_accumulator_fxp = _attention_pass(
-        query_row_pointers=query_row_pointers,
-        query_row_mask=query_row_mask,
-        causal_row_positions=causal_row_positions,
-        key_end_position=key_end_position,
-        head_dim_offsets=head_dim_offsets,
-        head_dim_mask=head_dim_mask,
-        kv_head_index=kv_head_index,
-        head_index=head_index,
-        softmax_scale=softmax_scale,
-        running_row_max=running_row_max,
-        softmax_denominator_fxp=softmax_denominator_fxp,
-        output_accumulator_fxp=output_accumulator_fxp,
-        alibi_slopes_ptr=alibi_slopes_ptr,
-        PASS=2,
-        IS_CAUSAL=IS_CAUSAL,
-        USE_ALIBI=USE_ALIBI,
-        QUERY_BLOCK_SIZE=QUERY_BLOCK_SIZE,
-        KEY_BLOCK_SIZE=KEY_BLOCK_SIZE,
-        HEAD_DIM=HEAD_DIM,
-        HEAD_DIM_CHUNK=HEAD_DIM_CHUNK,
-        FRACTIONAL_BITS=FRACTIONAL_BITS,
-        FIXED_POINT_DTYPE=FIXED_POINT_DTYPE,
-        IS_PAGED=IS_PAGED,
-        PAGE_SIZE=PAGE_SIZE,
-        K=K,
-        stride_key_seq=stride_key_seq,
-        stride_key_head=stride_key_head,
-        V=V,
-        stride_value_seq=stride_value_seq,
-        stride_value_head=stride_value_head,
-        batch_token_start=batch_token_start,
-        K_cache=K_cache,
-        stride_key_cache_block=stride_key_cache_block,
-        stride_key_cache_slot=stride_key_cache_slot,
-        stride_key_cache_head=stride_key_cache_head,
-        V_cache=V_cache,
-        stride_value_cache_block=stride_value_cache_block,
-        stride_value_cache_slot=stride_value_cache_slot,
-        stride_value_cache_head=stride_value_cache_head,
-        block_table=block_table,
-        stride_block_table_batch=stride_block_table_batch,
-        request_index=request_index,
-    )
+    for key_block_start in range(0, key_end_position, KEY_BLOCK_SIZE):
+        key_block_start = tl.multiple_of(key_block_start, KEY_BLOCK_SIZE)
+        key_positions = key_block_start + key_offsets
+        key_mask = key_positions < key_end_position
+
+        if IS_PAGED:
+            physical_block_index, in_block_offset = paged_kv_location(
+                block_table,
+                stride_block_table_batch,
+                request_index,
+                key_positions,
+                key_mask,
+                PAGE_SIZE,
+            )
+            key_column_pointers = (
+                K_cache
+                + physical_block_index * stride_key_cache_block
+                + in_block_offset * stride_key_cache_slot
+                + kv_head_index * stride_key_cache_head
+            )
+        else:
+            key_column_pointers = (
+                K
+                + (batch_token_start + key_positions) * stride_key_seq
+                + kv_head_index * stride_key_head
+            )
+
+        qk_fxp = tl.zeros([QUERY_BLOCK_SIZE, KEY_BLOCK_SIZE], dtype=FIXED_POINT_DTYPE)
+        for head_dim_chunk_start in tl.range(0, HEAD_DIM, HEAD_DIM_CHUNK):
+            head_dim_chunk_offsets = head_dim_chunk_start + tl.arange(0, HEAD_DIM_CHUNK)
+            head_dim_chunk_valid = head_dim_chunk_offsets < HEAD_DIM
+
+            query_chunk = tl.load(
+                query_row_pointers[:, None] + head_dim_chunk_offsets[None, :],
+                mask=query_row_mask[:, None] & head_dim_chunk_valid[None, :],
+                other=0.0,
+            ).to(tl.float16)
+            key_chunk = tl.load(
+                key_column_pointers[None, :] + head_dim_chunk_offsets[:, None],
+                mask=head_dim_chunk_valid[:, None] & key_mask[None, :],
+                other=0.0,
+            ).to(tl.float16)
+
+            qk_fxp += dot_chunk_fxp(
+                a=query_chunk,
+                b=key_chunk,
+                FRAC_BITS=FRACTIONAL_BITS,
+                FXP_DTYPE=FIXED_POINT_DTYPE,
+            )
+
+        qk = fixed_to_float(
+            x=qk_fxp,
+            fractional_bit_width=FRACTIONAL_BITS,
+            floating_point_type=tl.float32,
+        )
+        qk = qk * softmax_scale
+        if USE_ALIBI:
+            qk += alibi_slope * (
+                key_positions[None, :].to(tl.float32)
+                - causal_row_positions[:, None].to(tl.float32)
+            )
+
+        score_mask = key_mask[None, :]
+        if IS_CAUSAL:
+            score_mask = score_mask & (
+                causal_row_positions[:, None] >= key_positions[None, :]
+            )
+        qk = tl.where(score_mask, qk, float("-inf"))
+
+        if IS_PAGED:
+            value_pointers = (
+                V_cache
+                + physical_block_index[:, None] * stride_value_cache_block
+                + in_block_offset[:, None] * stride_value_cache_slot
+                + kv_head_index * stride_value_cache_head
+                + head_dim_offsets[None, :]
+            )
+        else:
+            value_pointers = (
+                V
+                + kv_head_index * stride_value_head
+                + (batch_token_start + key_positions[:, None]) * stride_value_seq
+                + head_dim_offsets[None, :]
+            )
+
+        attention_weights = tl.math.exp2(qk - running_row_max[:, None])
+        attention_weights_fxp = float_to_fixed(
+            x=attention_weights,
+            fractional_bit_width=FRACTIONAL_BITS,
+            fixed_point_type=FIXED_POINT_DTYPE,
+        )
+        softmax_denominator_fxp += tl.sum(attention_weights_fxp, axis=1)
+
+        value_chunk = tl.load(
+            value_pointers,
+            mask=key_mask[:, None] & head_dim_mask[None, :],
+            other=0.0,
+        ).to(tl.float16)
+        output_accumulator_fxp += dot_chunk_fxp(
+            a=attention_weights,
+            b=value_chunk,
+            FRAC_BITS=FRACTIONAL_BITS,
+            FXP_DTYPE=FIXED_POINT_DTYPE,
+        )
 
     softmax_denominator = fixed_to_float(
         x=softmax_denominator_fxp,
