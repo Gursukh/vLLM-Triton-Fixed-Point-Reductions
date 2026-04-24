@@ -7,8 +7,22 @@ from .fixed_point import fixed_to_float, float_to_fixed
 
 @triton.jit
 def dot_chunk_fxp(a, b, FRAC_BITS: tl.constexpr, FXP_DTYPE: tl.constexpr):
-    prod = a[:, :, None] * b[None, :, :]
-    return tl.sum(float_to_fixed(prod, FRAC_BITS, FXP_DTYPE), axis=1)
+    # Iterate over the shared dimension (D = a.shape[1]) one element at a time.
+    # The old approach (a[:,:,None] * b[None,:,:]) created an [M,D,N] intermediate
+    # that overflowed the register file and spilled to DRAM on every call.
+    # Here we use a compile-time select via tl.where to avoid the 3-D tensor;
+    # LLVM constant-folds the (arange==d) mask into a plain register move/zero.
+    D: tl.constexpr = a.shape[1]
+    M: tl.constexpr = a.shape[0]
+    N: tl.constexpr = b.shape[1]
+    acc = tl.zeros([M, N], dtype=FXP_DTYPE)
+    for d in tl.static_range(D):
+        sel = tl.arange(0, D) == d                          # [D] compile-time bool
+        a_col = tl.sum(tl.where(sel[None, :], a, 0.0), 1)  # [M]
+        b_row = tl.sum(tl.where(sel[:, None], b, 0.0), 0)  # [N]
+        outer = a_col[:, None] * b_row[None, :]             # [M, N]
+        acc += float_to_fixed(outer, FRAC_BITS, FXP_DTYPE)
+    return acc
 
 
 @triton.jit
@@ -57,23 +71,27 @@ def gemm_fxp_kernel(
         k_offs = k_start + tl.arange(0, D_CHUNK)
         k_valid = k_offs < Lk
 
-        # Load A chunk
+        # Load A chunk [ROWS, D_CHUNK] and B chunk [D_CHUNK, COLS]
         a = tl.load(
             a_row_ptrs[:, None] + k_offs[None, :] * stride_a_k,
             mask=row_mask[:, None] & k_valid[None, :],
             other=0.0,
         ).to(tl.float32)
 
-        # Load B chunk
         b = tl.load(
             b_col_ptrs[None, :] + k_offs[:, None] * stride_b_k,
             mask=k_valid[:, None] & col_mask[None, :],
             other=0.0,
         ).to(tl.float32)
 
-        # Broadcast, multiply, convert to fixed-point, and sum over the inner dimension
-        prod = a[:, :, None] * b[None, :, :]
-        acc += tl.sum(float_to_fixed(prod, FRAC_BITS, FXP_DTYPE), axis=1)
+        # Accumulate one outer product at a time: avoids [ROWS, D_CHUNK, COLS]
+        # intermediate that would spill to DRAM (e.g. 512 KB at BLOCK_K=32).
+        for d in tl.static_range(D_CHUNK):
+            sel = tl.arange(0, D_CHUNK) == d
+            a_col = tl.sum(tl.where(sel[None, :], a, 0.0), 1)  # [ROWS]
+            b_row = tl.sum(tl.where(sel[:, None], b, 0.0), 0)  # [COLS]
+            outer = a_col[:, None] * b_row[None, :]             # [ROWS, COLS]
+            acc += float_to_fixed(outer, FRAC_BITS, FXP_DTYPE)
 
     # Convert back to float and return to the caller
     return fixed_to_float(acc, FRAC_BITS, tl.float32)
@@ -172,7 +190,7 @@ def launch_gemm_fxp(
     # Launch the kernel
     BLOCK_M = 64
     BLOCK_N = 64
-    BLOCK_K = 32
+    BLOCK_K = 64
 
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
 
