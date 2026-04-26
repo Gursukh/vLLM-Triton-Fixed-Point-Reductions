@@ -12,40 +12,18 @@ from .config import get_runtime_config
 @CustomOp.register_oot(name="RMSNorm")
 class DeterministicRMSNorm(RMSNorm):
     def __init__(self, *args, **kwargs) -> None:
-        """Cache the runtime fixed-point config; weight_fp32 is built lazily."""
+        """Cache the runtime fixed-point config; weight is widened in-kernel."""
         super().__init__(*args, **kwargs)
         cfg = get_runtime_config()
         self._fxp_frac_bits = cfg.frac_bits
         self._fxp_int_bits = cfg.fxp_int_bits
-        # Pre-cast weight is built on first forward to ensure vLLM's weight
-        # loader has populated self.weight with checkpoint values first.
-        self._weight_fp32_cache: torch.Tensor | None = None
-        self._weight_fp32_cache_ptr: int = 0
-
-    def _get_weight_fp32(self) -> torch.Tensor:
-        """Return the weight upcast to fp32, cached and invalidated on storage swap.
-
-        The cache is keyed by the underlying storage pointer so hot-swapping
-        the weight (LoRA, adapter reload) invalidates the cached fp32 copy.
-        """
-        ptr = self.weight.data_ptr()
-        if self._weight_fp32_cache is None or self._weight_fp32_cache_ptr != ptr:
-            with torch.no_grad():
-                self._weight_fp32_cache = self.weight.detach().to(torch.float32)
-            self._weight_fp32_cache_ptr = ptr
-        return self._weight_fp32_cache
-
-    @property
-    def weight_fp32(self) -> torch.Tensor:
-        """Float32 view of the layer weight (lazily materialised, hot-swap aware)."""
-        return self._get_weight_fp32()
 
     def _det_norm_torch(self, x_fp32: torch.Tensor) -> torch.Tensor:
         """Deterministic RMSNorm in pure torch (CPU path).
 
         Uses the same fixed-point cast → integer sum → float pipeline as the
         Triton kernel, so CPU and CUDA paths are bit-identical for the same
-        inputs (within fp32 rounding of the final rrms multiply).
+        inputs (within fp32 rounding of the final ``rrms`` multiply).
         """
         frac_bits = self._fxp_frac_bits
         int_bits = self._fxp_int_bits
@@ -60,7 +38,7 @@ class DeterministicRMSNorm(RMSNorm):
         sum_fp = sum_int.to(torch.float32) / scale
         mean_sq = (sum_fp / x_fp32.shape[-1]).clamp_min_(0.0)
         rrms = torch.rsqrt(mean_sq + self.variance_epsilon)
-        return x_fp32 * self.weight_fp32 * rrms.unsqueeze(-1)
+        return x_fp32 * self.weight.to(torch.float32) * rrms.unsqueeze(-1)
 
     def forward_native(
         self,
@@ -88,9 +66,14 @@ class DeterministicRMSNorm(RMSNorm):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Deterministic RMSNorm forward on CUDA, matching vLLM's fused-residual API.
 
-        When residual is provided the kernel performs residual += x in
+        When ``residual`` is provided the kernel performs ``residual += x`` in
         fp32 in-place (matching vLLM's fused contract) and normalises the
-        accumulated value, returning (normalised, residual).
+        accumulated value, returning ``(normalised, residual)``.
+
+        The kernel widens the weight via ``tl.load(W_ptr).to(tl.float32)``
+        internally, so we pass ``self.weight`` directly without a Python-side
+        fp32 cache. The previous ``data_ptr()``-keyed cache tripped Dynamo
+        under ``torch.compile`` (DataPtrVariable can't be ``isinstance``'d).
         """
         orig_dtype = x.dtype
 
@@ -99,7 +82,7 @@ class DeterministicRMSNorm(RMSNorm):
             out = rms_norm_fxp_residual_op(
                 x.to(torch.float32),
                 new_residual_fp32,
-                self.weight_fp32,
+                self.weight,
                 self.variance_epsilon,
                 self._fxp_frac_bits,
                 self._fxp_int_bits,
@@ -108,7 +91,7 @@ class DeterministicRMSNorm(RMSNorm):
 
         out = rms_norm_fxp_op(
             x.to(torch.float32),
-            self.weight_fp32,
+            self.weight,
             self.variance_epsilon,
             self._fxp_frac_bits,
             self._fxp_int_bits,
