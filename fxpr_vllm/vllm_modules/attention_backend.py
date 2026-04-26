@@ -77,6 +77,11 @@ class DeterministicAttentionImpl(AttentionImpl):
         kv_cache_dtype: str = "auto",
         logits_soft_cap: float | None = None,
         attn_type: AttentionType | None = AttentionType.DECODER,
+        # vLLM v1 has been growing the signature (kv_sharing_target_layer_name,
+        # sinks, use_irope, …). Accept any further positional args here so
+        # we stay compatible with new vLLM revisions without caring about
+        # the names we don't use.
+        *_extra_positional,
         **kwargs,
     ) -> None:
         # vLLM passes attn_type=None to mean "default" (decoder). Reject only
