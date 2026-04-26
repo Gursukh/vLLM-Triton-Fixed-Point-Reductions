@@ -7,7 +7,7 @@ from fxpr_vllm.fixed_point_kernels.fixed_point import (
     float_to_fixed,
     RCP_LN2,
 )
-from .gemm import dot_chunk_fxp, paged_kv_location
+from .gemm import dot_chunk_fxp_ptr, dot_chunk_fxp_tile, paged_kv_location
 
 
 def prepare_log2_softmax_scale(head_dim, softmax_scale=None):
@@ -104,28 +104,17 @@ def attention_fwd_fxp_body(
                 + kv_head_index * stride_key_head
             )
 
-        qk_fxp = tl.zeros([QUERY_BLOCK_SIZE, KEY_BLOCK_SIZE], dtype=FXP_DTYPE)
-        for head_dim_chunk_start in tl.range(0, HEAD_DIM, HEAD_DIM_CHUNK):
-            head_dim_chunk_offsets = head_dim_chunk_start + tl.arange(0, HEAD_DIM_CHUNK)
-            head_dim_chunk_valid = head_dim_chunk_offsets < HEAD_DIM
-
-            query_chunk = tl.load(
-                query_row_pointers[:, None] + head_dim_chunk_offsets[None, :],
-                mask=query_row_mask[:, None] & head_dim_chunk_valid[None, :],
-                other=0.0,
-            ).to(tl.float16)
-            key_chunk = tl.load(
-                key_column_pointers[None, :] + head_dim_chunk_offsets[:, None],
-                mask=head_dim_chunk_valid[:, None] & key_mask[None, :],
-                other=0.0,
-            ).to(tl.float16)
-
-            qk_fxp += dot_chunk_fxp(
-                a=query_chunk,
-                b=key_chunk,
-                FRAC_BITS=FRAC_BITS,
-                FXP_DTYPE=FXP_DTYPE,
-            )
+        qk_fxp = dot_chunk_fxp_ptr(
+            a_row_ptrs=query_row_pointers,
+            b_col_ptrs=key_column_pointers,
+            stride_a_d=1,  # head dim is innermost in q
+            stride_b_d=1,  # head dim is innermost in k
+            row_mask=query_row_mask,
+            col_mask=key_mask,
+            D=HEAD_DIM,
+            FRAC_BITS=FRAC_BITS,
+            FXP_DTYPE=FXP_DTYPE,
+        )
 
         qk = fixed_to_float(
             x=qk_fxp,
@@ -191,28 +180,17 @@ def attention_fwd_fxp_body(
                 + kv_head_index * stride_key_head
             )
 
-        qk_fxp = tl.zeros([QUERY_BLOCK_SIZE, KEY_BLOCK_SIZE], dtype=FXP_DTYPE)
-        for head_dim_chunk_start in tl.range(0, HEAD_DIM, HEAD_DIM_CHUNK):
-            head_dim_chunk_offsets = head_dim_chunk_start + tl.arange(0, HEAD_DIM_CHUNK)
-            head_dim_chunk_valid = head_dim_chunk_offsets < HEAD_DIM
-
-            query_chunk = tl.load(
-                query_row_pointers[:, None] + head_dim_chunk_offsets[None, :],
-                mask=query_row_mask[:, None] & head_dim_chunk_valid[None, :],
-                other=0.0,
-            ).to(tl.float16)
-            key_chunk = tl.load(
-                key_column_pointers[None, :] + head_dim_chunk_offsets[:, None],
-                mask=head_dim_chunk_valid[:, None] & key_mask[None, :],
-                other=0.0,
-            ).to(tl.float16)
-
-            qk_fxp += dot_chunk_fxp(
-                a=query_chunk,
-                b=key_chunk,
-                FRAC_BITS=FRAC_BITS,
-                FXP_DTYPE=FXP_DTYPE,
-            )
+        qk_fxp = dot_chunk_fxp_ptr(
+            a_row_ptrs=query_row_pointers,
+            b_col_ptrs=key_column_pointers,
+            stride_a_d=1,
+            stride_b_d=1,
+            row_mask=query_row_mask,
+            col_mask=key_mask,
+            D=HEAD_DIM,
+            FRAC_BITS=FRAC_BITS,
+            FXP_DTYPE=FXP_DTYPE,
+        )
 
         qk = fixed_to_float(
             x=qk_fxp,
@@ -269,11 +247,11 @@ def attention_fwd_fxp_body(
             mask=key_mask[:, None] & head_dim_mask[None, :],
             other=0.0,
         ).to(tl.float16)
-        output_accumulator_fxp += dot_chunk_fxp(
-            a=attention_weights,
-            b=value_chunk,
-            FRAC_BITS=FRAC_BITS,
-            FXP_DTYPE=FXP_DTYPE,
+        # attention_weights is computed in registers (no memory backing)
+        # so we use the tile-based variant; the runtime tl.range keeps
+        # compile time bounded.
+        output_accumulator_fxp += dot_chunk_fxp_tile(
+            attention_weights, value_chunk, FRAC_BITS, FXP_DTYPE
         )
 
     softmax_denominator = fixed_to_float(

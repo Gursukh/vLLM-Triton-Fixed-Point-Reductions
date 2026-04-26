@@ -23,7 +23,7 @@ class DeterministicRMSNorm(RMSNorm):
 
         Uses the same fixed-point cast → integer sum → float pipeline as the
         Triton kernel, so CPU and CUDA paths are bit-identical for the same
-        inputs (within fp32 rounding of the final ``rrms`` multiply).
+        inputs (within fp32 rounding of the final rrms multiply).
         """
         frac_bits = self._fxp_frac_bits
         int_bits = self._fxp_int_bits
@@ -66,14 +66,14 @@ class DeterministicRMSNorm(RMSNorm):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Deterministic RMSNorm forward on CUDA, matching vLLM's fused-residual API.
 
-        When ``residual`` is provided the kernel performs ``residual += x`` in
+        When residual is provided the kernel performs residual += x in
         fp32 in-place (matching vLLM's fused contract) and normalises the
-        accumulated value, returning ``(normalised, residual)``.
+        accumulated value, returning (normalised, residual).
 
-        The kernel widens the weight via ``tl.load(W_ptr).to(tl.float32)``
-        internally, so we pass ``self.weight`` directly without a Python-side
-        fp32 cache. The previous ``data_ptr()``-keyed cache tripped Dynamo
-        under ``torch.compile`` (DataPtrVariable can't be ``isinstance``'d).
+        The kernel widens the weight via tl.load(W_ptr).to(tl.float32)
+        internally, so we pass self.weight directly without a Python-side
+        fp32 cache. The previous data_ptr()-keyed cache tripped Dynamo
+        under torch.compile (DataPtrVariable can't be isinstance'd).
         """
         orig_dtype = x.dtype
 

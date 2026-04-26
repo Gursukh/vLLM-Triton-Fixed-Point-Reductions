@@ -5,21 +5,68 @@ from .fixed_point import fixed_to_float, float_to_fixed
 
 
 @triton.jit
-def dot_chunk_fxp(a, b, FRAC_BITS: tl.constexpr, FXP_DTYPE: tl.constexpr):
-    # Iterate over the shared dimension (D = a.shape[1]) one element at a time.
-    # The old approach (a[:,:,None] * b[None,:,:]) created an [M,D,N] intermediate
-    # that overflowed the register file and spilled to DRAM on every call.
-    # Here we use a compile-time select via tl.where to avoid the 3-D tensor;
-    # LLVM constant-folds the (arange==d) mask into a plain register move/zero.
+def dot_chunk_fxp_ptr(
+    a_row_ptrs,
+    b_col_ptrs,
+    stride_a_d,
+    stride_b_d,
+    row_mask,
+    col_mask,
+    D,
+    FRAC_BITS: tl.constexpr,
+    FXP_DTYPE: tl.constexpr,
+):
+    """Determinism-preserving dot product where both operands live in memory.
+
+    For each runtime d in [0, D):
+      * load a 1-D column of A (shape [M]) from a_row_ptrs + d * stride_a_d
+      * load a 1-D row of B (shape [N]) from b_col_ptrs + d * stride_b_d
+      * form the per-element fp32 outer product, quantise, and integer-add
+        into the accumulator.
+
+    The K-loop is a *runtime* tl.range (not tl.static_range), so the
+    compiled basic block is small — Triton emits the body once and iterates
+    at runtime. This drops kernel compile time from minutes to seconds while
+    keeping the cross-split / cross-warp determinism guarantee: the integer
+    accumulator is associative, and each per-element product is quantised
+    before any add.
+    """
+    M: tl.constexpr = row_mask.shape[0]
+    N: tl.constexpr = col_mask.shape[0]
+    acc = tl.zeros([M, N], dtype=FXP_DTYPE)
+    for d in tl.range(D, loop_unroll_factor=4):
+        a_col = tl.load(
+            a_row_ptrs + d * stride_a_d, mask=row_mask, other=0.0
+        ).to(tl.float32)
+        b_row = tl.load(
+            b_col_ptrs + d * stride_b_d, mask=col_mask, other=0.0
+        ).to(tl.float32)
+        outer = a_col[:, None] * b_row[None, :]
+        acc += float_to_fixed(outer, FRAC_BITS, FXP_DTYPE)
+    return acc
+
+
+@triton.jit
+def dot_chunk_fxp_tile(a, b, FRAC_BITS: tl.constexpr, FXP_DTYPE: tl.constexpr):
+    """Determinism-preserving dot product for register-resident tiles.
+
+    Used by the pv-dot in attention, where attention_weights is computed
+    in registers and has no memory backing. Falls back to the tile-selector
+    pattern (tl.where + tl.sum to extract column d) but inside a
+    tl.range runtime loop rather than tl.static_range — same compile
+    speedup as dot_chunk_fxp_ptr, paying an O(M*D + D*N) per-iteration
+    selector cost in exchange for not needing memory pointers.
+    """
     D: tl.constexpr = a.shape[1]
     M: tl.constexpr = a.shape[0]
     N: tl.constexpr = b.shape[1]
+    d_arange: tl.constexpr = tl.arange(0, D)
     acc = tl.zeros([M, N], dtype=FXP_DTYPE)
-    for d in tl.static_range(D):
-        sel = tl.arange(0, D) == d  # [D] compile-time bool
-        a_col = tl.sum(tl.where(sel[None, :], a, 0.0), 1)  # [M]
-        b_row = tl.sum(tl.where(sel[:, None], b, 0.0), 0)  # [N]
-        outer = a_col[:, None] * b_row[None, :]  # [M, N]
+    for d in tl.range(D, loop_unroll_factor=4):
+        sel = d_arange == d
+        a_col = tl.sum(tl.where(sel[None, :], a, 0.0), 1)
+        b_row = tl.sum(tl.where(sel[:, None], b, 0.0), 0)
+        outer = a_col[:, None] * b_row[None, :]
         acc += float_to_fixed(outer, FRAC_BITS, FXP_DTYPE)
     return acc
 
@@ -67,21 +114,19 @@ def gemm_fxp_kernel(
     acc = tl.zeros([ROWS, COLS], dtype=FXP_DTYPE)
 
     for k_start in tl.range(0, Lk, D_CHUNK):
-        k_offs = k_start + tl.arange(0, D_CHUNK)
-        k_valid = k_offs < Lk
-
-        a = tl.load(
-            a_row_ptrs[:, None] + k_offs[None, :] * stride_a_k,
-            mask=row_mask[:, None] & k_valid[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        b = tl.load(
-            b_col_ptrs[None, :] + k_offs[:, None] * stride_b_k,
-            mask=k_valid[:, None] & col_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
-
-        acc += dot_chunk_fxp(a, b, FRAC_BITS, FXP_DTYPE)
+        # Number of valid K elements in this chunk (handles non-multiple Lk).
+        d = tl.minimum(D_CHUNK, Lk - k_start)
+        acc += dot_chunk_fxp_ptr(
+            a_row_ptrs=a_row_ptrs + k_start * stride_a_k,
+            b_col_ptrs=b_col_ptrs + k_start * stride_b_k,
+            stride_a_d=stride_a_k,
+            stride_b_d=stride_b_k,
+            row_mask=row_mask,
+            col_mask=col_mask,
+            D=d,
+            FRAC_BITS=FRAC_BITS,
+            FXP_DTYPE=FXP_DTYPE,
+        )
 
     return fixed_to_float(acc, FRAC_BITS, tl.float32)
 
