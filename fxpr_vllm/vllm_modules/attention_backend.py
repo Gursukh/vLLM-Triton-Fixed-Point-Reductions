@@ -75,9 +75,8 @@ class DeterministicAttentionImpl(AttentionImpl):
         alibi_slopes: list[float] | None,
         sliding_window: int | None,
         kv_cache_dtype: str = "auto",
-        blocktable_size: int = 16,
         logits_soft_cap: float | None = None,
-        attn_type: AttentionType = AttentionType.DECODER,
+        attn_type: AttentionType | None = AttentionType.DECODER,
         **kwargs,
     ) -> None:
         # vLLM passes attn_type=None to mean "default" (decoder). Reject only
@@ -102,7 +101,6 @@ class DeterministicAttentionImpl(AttentionImpl):
         self.num_kv_heads = num_kv_heads
         self.num_kv_groups = num_heads // num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
-        self.blocktable_size = blocktable_size
         # logits_soft_cap=None / 0 / negative all mean "off"; the kernel
         # treats LOGIT_SOFTCAP > 0.0 as the activation condition.
         self.logits_soft_cap = float(logits_soft_cap) if logits_soft_cap else 0.0
