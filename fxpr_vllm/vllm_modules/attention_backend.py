@@ -80,11 +80,14 @@ class DeterministicAttentionImpl(AttentionImpl):
         attn_type: AttentionType = AttentionType.DECODER,
         **kwargs,
     ) -> None:
-        if attn_type != AttentionType.DECODER:
+        # vLLM passes attn_type=None to mean "default" (decoder). Reject only
+        # explicit encoder / cross-attention types we don't support.
+        if attn_type is not None and attn_type != AttentionType.DECODER:
             raise NotImplementedError(
                 f"DeterministicAttention only supports decoder attention; "
                 f"got attn_type={attn_type!r}."
             )
+        attn_type = attn_type or AttentionType.DECODER
         if kv_cache_dtype not in ("auto", "fp16", "bf16"):
             raise NotImplementedError(
                 f"DeterministicAttention does not support kv_cache_dtype="
