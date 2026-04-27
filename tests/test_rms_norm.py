@@ -1,33 +1,8 @@
 import pytest
 import torch
-import triton
-import triton.language as tl
 
+import fxpr_vllm._cuda  # noqa: F401  (registers torch.ops.fxpr.*)
 from tests.fixed_point_helpers import requires_cuda
-from fxpr_vllm.fixed_point_kernels import rms_norm
-
-
-@triton.jit
-def _rms_norm_float_kernel(
-    X_ptr,
-    W_ptr,
-    Y_ptr,
-    stride_x,
-    hidden_size,
-    eps: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK)
-    mask = cols < hidden_size
-
-    x = tl.load(X_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(W_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-
-    sum_float = tl.sum(x * x, axis=0)
-    rrms = 1.0 / tl.sqrt(sum_float / hidden_size + eps)
-    y = x * w * rrms
-    tl.store(Y_ptr + row * stride_x + cols, y, mask=mask)
 
 
 def _run_rms_norm_kernel(
@@ -37,49 +12,21 @@ def _run_rms_norm_kernel(
     assert x.dtype == torch.float32 and w.dtype == torch.float32
     assert x.ndim == 2 and w.ndim == 1
     assert x.shape[1] == w.shape[0]
-
-    batch, hidden = x.shape
-    y = torch.empty_like(x)
-    block = triton.next_power_of_2(max(hidden, 1))
-
-    rms_norm.rms_norm_fxp_kernel[(batch,)](
-        x,
-        w,
-        y,
-        x,  # residual buffer (unused; HAS_RESIDUAL=False)
-        x.stride(0),
-        hidden,
-        eps=eps,
-        BLOCK=block,
-        FRAC_BITS=16,
-        FXP_DTYPE=tl.int64,
-        HAS_RESIDUAL=False,
-    )
-    return y
+    return torch.ops.fxpr.rms_norm_fxp(x, w, eps, 16, 64)
 
 
 def _run_rms_norm_float_kernel(
     x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
+    """Torch-native fp32 RMSNorm reference."""
     assert x.is_cuda and w.is_cuda
     assert x.dtype == torch.float32 and w.dtype == torch.float32
     assert x.ndim == 2 and w.ndim == 1
     assert x.shape[1] == w.shape[0]
 
-    batch, hidden = x.shape
-    y = torch.empty_like(x)
-    block = triton.next_power_of_2(max(hidden, 1))
-
-    _rms_norm_float_kernel[(batch,)](
-        x,
-        w,
-        y,
-        x.stride(0),
-        hidden,
-        eps=eps,
-        BLOCK=block,
-    )
-    return y
+    mean_sq = (x * x).mean(dim=-1, keepdim=True)
+    rrms = 1.0 / torch.sqrt(mean_sq + eps)
+    return x * w * rrms
 
 
 def _ordered_float16_sum_of_squares(values: list[float]) -> torch.Tensor:

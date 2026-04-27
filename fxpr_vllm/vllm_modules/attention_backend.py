@@ -11,11 +11,14 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 
-from ..fixed_point_kernels.attention import unified_attention_fxp
-from ..fixed_point_kernels.fixed_point import RCP_LN2, fixed_tl_dtype
+from .. import _cuda  # noqa: F401  (registers torch.ops.fxpr.*)
 from .config import get_runtime_config
 
 logger = logging.getLogger("fxpr_vllm")
+
+# Pre-scale factor for ALiBi slopes: the kernel runs the softmax in
+# log2 domain, so slopes are pre-multiplied by 1/ln(2) here once.
+RCP_LN2 = 1.4426950408889634
 
 _flash_meta_cls: type[AttentionMetadata] | None = None
 _flash_builder_cls: type[AttentionMetadataBuilder] | None = None
@@ -112,7 +115,7 @@ class DeterministicAttentionImpl(AttentionImpl):
         self.window_size = int(sliding_window) if sliding_window else 0
         self.attn_type = attn_type
         self.frac_bits = cfg.frac_bits
-        self.fxp_dtype = fixed_tl_dtype(cfg.fxp_int_bits)
+        self.fxp_int_bits = cfg.fxp_int_bits
 
         if alibi_slopes is not None:
             slopes = torch.tensor(alibi_slopes, dtype=torch.float32) * RCP_LN2
@@ -177,22 +180,35 @@ class DeterministicAttentionImpl(AttentionImpl):
         block_table = attn_metadata.block_table
         max_query_len = int(attn_metadata.max_query_len)
 
-        unified_attention_fxp(
-            q=query,
-            kv_cache=kv_cache,
-            o=output,
-            query_start_loc=query_start_loc,
-            seq_lens=seq_lens,
-            block_table=block_table,
-            max_query_len=max_query_len,
-            alibi_slopes=self.alibi_slopes,
-            is_causal=True,
-            softmax_scale=self.scale,
-            frac_bits=self.frac_bits,
-            fxp_dtype=self.fxp_dtype,
-            logits_soft_cap=self.logits_soft_cap,
-            window_size=self.window_size,
+        # Kernel expects fp32 q + kv_cache. vLLM hands us bf16/fp16 in
+        # most configurations; widen here so the per-element fp32
+        # multiply path stays deterministic.
+        q_in = query if query.dtype == torch.float32 else query.to(torch.float32)
+        kv_in = kv_cache if kv_cache.dtype == torch.float32 else kv_cache.to(torch.float32)
+        out_fp32 = (
+            output if output.dtype == torch.float32
+            else torch.empty_like(output, dtype=torch.float32)
         )
+
+        torch.ops.fxpr.unified_attention_fxp(
+            q_in,
+            kv_in,
+            out_fp32,
+            query_start_loc,
+            seq_lens,
+            block_table,
+            max_query_len,
+            self.alibi_slopes,
+            True,
+            float(self.scale),
+            int(self.frac_bits),
+            int(self.fxp_int_bits),
+            float(self.logits_soft_cap),
+            int(self.window_size),
+        )
+
+        if out_fp32.data_ptr() != output.data_ptr():
+            output.copy_(out_fp32.to(output.dtype))
 
         return output.view(num_tokens, self.num_heads * self.head_size)
 

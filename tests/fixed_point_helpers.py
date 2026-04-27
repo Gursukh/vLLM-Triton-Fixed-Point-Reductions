@@ -1,68 +1,30 @@
 import pytest
 import torch
-import triton
-import triton.language as tl
 
-from fxpr_vllm.fixed_point_kernels.fixed_point import (
-    float_to_fixed as _float_to_fixed_jit,
-    fixed_to_float as _fixed_to_float_jit,
-)
+import fxpr_vllm._cuda  # noqa: F401  (registers torch.ops.fxpr.*)
 
 
-@triton.jit
-def _float_to_fixed_kernel(
-    x_ptr, y_ptr, n, frac_bits: tl.constexpr, BLOCK: tl.constexpr, OUT: tl.constexpr
-):
-    offs = tl.arange(0, BLOCK)
-    mask = offs < n
-    x = tl.load(x_ptr + offs, mask=mask)
-    y = _float_to_fixed_jit(x, frac_bits, OUT)
-    tl.store(y_ptr + offs, y, mask=mask)
+_INT_BITS_BY_DTYPE = {
+    torch.int16: 16,
+    torch.int32: 32,
+    torch.int64: 64,
+}
 
-
-@triton.jit
-def _fixed_to_float_kernel(
-    x_ptr, y_ptr, n, frac_bits: tl.constexpr, BLOCK: tl.constexpr, OUT: tl.constexpr
-):
-    offs = tl.arange(0, BLOCK)
-    mask = offs < n
-    x = tl.load(x_ptr + offs, mask=mask)
-    y = _fixed_to_float_jit(x, frac_bits, OUT)
-    tl.store(y_ptr + offs, y, mask=mask)
-
-
-_TL = {
-    torch.int16: tl.int16,
-    torch.int32: tl.int32,
-    torch.int64: tl.int64,
-    torch.float16: tl.float16,
-    torch.float32: tl.float32,
-    torch.float64: tl.float64,
+_FLOAT_BITS_BY_DTYPE = {
+    torch.float16: 16,
+    torch.float32: 32,
+    torch.float64: 64,
 }
 
 
-def float_to_fixed(
-    x: torch.Tensor, frac_bits: tl.constexpr, out: torch.dtype
-) -> torch.Tensor:
-    n = x.numel()
-    block = triton.next_power_of_2(max(n, 1))
-    y = torch.empty(n, device=x.device, dtype=out)
-    _float_to_fixed_kernel[(1,)](
-        x.contiguous(), y, n, frac_bits, BLOCK=block, OUT=_TL[out]
-    )
-    return y.view_as(x)
+def float_to_fixed(x: torch.Tensor, frac_bits: int, out: torch.dtype) -> torch.Tensor:
+    int_bits = _INT_BITS_BY_DTYPE[out]
+    return torch.ops.fxpr.float_to_fixed(x.contiguous(), int(frac_bits), int_bits)
 
 
-def fixed_to_float(
-    x: torch.Tensor, frac_bits: tl.constexpr, out: torch.dtype
-) -> torch.Tensor:
-    n = x.numel()
-    block = triton.next_power_of_2(max(n, 1))
-    y = torch.empty(n, device=x.device, dtype=out)
-    _fixed_to_float_kernel[(1,)](
-        x.contiguous(), y, n, frac_bits, BLOCK=block, OUT=_TL[out]
-    )
-    return y.view_as(x)
+def fixed_to_float(x: torch.Tensor, frac_bits: int, out: torch.dtype) -> torch.Tensor:
+    float_bits = _FLOAT_BITS_BY_DTYPE[out]
+    return torch.ops.fxpr.fixed_to_float(x.contiguous(), int(frac_bits), float_bits)
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -72,9 +34,12 @@ def gemm_fxp_test(
     a: torch.Tensor, b: torch.Tensor, frac_bits: int = 16, fxp_int_bits: int = 32
 ) -> torch.Tensor:
     """Test adapter for the registered :func:`fxpr::gemm_fxp` torch op."""
-    from fxpr_vllm.library_ops import gemm_fxp as gemm_fxp_op
+    return torch.ops.fxpr.gemm_fxp(
+        a.contiguous(), b.contiguous(), int(frac_bits), int(fxp_int_bits)
+    )
 
-    return gemm_fxp_op(a.contiguous(), b.contiguous(), frac_bits, fxp_int_bits)
+
+RCP_LN2 = 1.4426950408889634
 
 
 def prefill_fxp_test(
@@ -98,11 +63,6 @@ def prefill_fxp_test(
     becomes the absolute token index and the kernel's paged path collapses
     to the non-paged behaviour the prefill tests originally exercised.
     """
-    import triton.language as tl
-
-    from fxpr_vllm.fixed_point_kernels.attention import unified_attention_fxp
-    from fxpr_vllm.fixed_point_kernels.fixed_point import RCP_LN2
-
     # unified_attention_fxp expects pre-scaled (by RCP_LN2) alibi slopes.
     if alibi_slopes is not None:
         alibi_slopes = alibi_slopes * RCP_LN2
@@ -139,17 +99,19 @@ def prefill_fxp_test(
     query_start_loc[0] = 0
     query_start_loc[1:] = torch.cumsum(b_seq_len, dim=0)
 
-    unified_attention_fxp(
-        q=q,
-        kv_cache=kv_cache,
-        o=o,
-        query_start_loc=query_start_loc,
-        seq_lens=b_seq_len.to(torch.int32),
-        block_table=block_table,
-        max_query_len=max_input_len,
-        alibi_slopes=alibi_slopes,
-        is_causal=is_causal,
-        softmax_scale=softmax_scale,
-        frac_bits=frac_bits,
-        fxp_dtype=tl.int32,
+    torch.ops.fxpr.unified_attention_fxp(
+        q,
+        kv_cache,
+        o,
+        query_start_loc,
+        b_seq_len.to(torch.int32),
+        block_table,
+        int(max_input_len),
+        alibi_slopes,
+        bool(is_causal),
+        None if softmax_scale is None else float(softmax_scale),
+        int(frac_bits),
+        32,  # fxp_int_bits
+        0.0,  # logit_softcap
+        0,    # window_size
     )

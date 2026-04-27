@@ -1,126 +1,80 @@
+"""Public op surface — thin shim over the CUDA extension.
+
+After the CUDA migration, every operation runs through `fxpr_vllm._cuda`,
+which registers `torch.ops.fxpr.*` at import time. This module re-exports
+those ops under their Python names and provides a small Python helper
+for the tier-2 int8 GEMM that bundles per-row scale computation +
+quantisation + MMA into one call.
+"""
+
+from __future__ import annotations
+
 import torch
-import triton
-from torch.library import triton_op, wrap_triton
 
-from .fixed_point_kernels.fixed_point import fixed_tl_dtype
-from .fixed_point_kernels.gemm import gemm_fxp as _gemm_fxp_kernel
-from .fixed_point_kernels.rms_norm import rms_norm_fxp_kernel as _rms_norm_fxp_kernel
-
-_GEMM_BLOCK_M = 64
-_GEMM_BLOCK_N = 64
-_GEMM_BLOCK_K = 64
+from . import _cuda  # noqa: F401  (registers torch.ops.fxpr.*)
 
 
-@triton_op("fxpr::gemm_fxp", mutates_args=())
-def gemm_fxp(
+# Re-exports of the registered torch.ops.fxpr.* ops.
+gemm_fxp = torch.ops.fxpr.gemm_fxp
+gemm_fxp_int8 = torch.ops.fxpr.gemm_fxp_int8
+rms_norm_fxp = torch.ops.fxpr.rms_norm_fxp
+rms_norm_fxp_residual = torch.ops.fxpr.rms_norm_fxp_residual
+log_softmax_fxp = torch.ops.fxpr.log_softmax_fxp
+compute_per_row_scale = torch.ops.fxpr.compute_per_row_scale
+float_to_fixed = torch.ops.fxpr.float_to_fixed
+fixed_to_float = torch.ops.fxpr.fixed_to_float
+
+
+def quantise_to_int8(
+    x: torch.Tensor, scale_fp16: torch.Tensor
+) -> torch.Tensor:
+    """Per-row int8 quantisation: x_int8[i, k] = clamp(round(x[i,k] / s[i]), [-127, 127]).
+
+    Both x and scale_fp16 are expected on the same device.
+    The scale tensor must be precomputed via :func:`compute_per_row_scale`
+    (or any equivalently split-invariant procedure) so the result stays
+    bit-identical regardless of how rows are partitioned across launches.
+    """
+    assert x.is_cuda and scale_fp16.is_cuda
+    assert x.dim() == 2
+    assert scale_fp16.shape == (x.shape[0],)
+    s = scale_fp16.to(torch.float32).unsqueeze(-1)
+    q = torch.round(x / s).clamp_(-127, 127).to(torch.int8)
+    return q
+
+
+def launch_gemm_fxp_mma(
     a: torch.Tensor,
     b: torch.Tensor,
-    frac_bits: int,
-    fxp_int_bits: int,
+    *,
+    q_frac_bits: int = 8,
+    frac_bits: int = 16,
+    fxp_int_bits: int = 32,
+    block_k: int | None = None,
 ) -> torch.Tensor:
-    M, K = a.shape
-    _, N = b.shape
-    c = torch.empty((M, N), device=a.device, dtype=torch.float32)
-    fxp_dtype = fixed_tl_dtype(fxp_int_bits)
-    grid = (triton.cdiv(M, _GEMM_BLOCK_M) * triton.cdiv(N, _GEMM_BLOCK_N),)
-    wrap_triton(_gemm_fxp_kernel)[grid](
-        a_ptr=a,
-        b_ptr=b,
-        c_ptr=c,
-        M=M,
-        N=N,
-        K=K,
-        stride_am=a.stride(0),
-        stride_ak=a.stride(1),
-        stride_bk=b.stride(0),
-        stride_bn=b.stride(1),
-        stride_cm=c.stride(0),
-        stride_cn=c.stride(1),
-        BLOCK_SIZE_M=_GEMM_BLOCK_M,
-        BLOCK_SIZE_N=_GEMM_BLOCK_N,
-        BLOCK_SIZE_K=_GEMM_BLOCK_K,
-        FRAC_BITS=frac_bits,
-        FXP_DTYPE=fxp_dtype,
-    )
-    return c
+    """Tier-2 int8 GEMM with per-row/per-col scales.
 
+    The original Triton-era signature took q_frac_bits to drive
+    static int8 scaling. The deterministic CUDA path computes
+    split-invariant per-row scales instead; q_frac_bits and
+    block_k are accepted for backwards compatibility but ignored.
+    The K-accumulator is integer over int8 products, so the result is
+    bit-identical for any K-block schedule.
+    """
+    del q_frac_bits, block_k
 
-@gemm_fxp.register_fake
-def _(a, b, frac_bits, fxp_int_bits):
-    return a.new_empty((a.shape[0], b.shape[1]), dtype=torch.float32)
+    assert a.is_cuda and b.is_cuda
+    assert a.dim() == 2 and b.dim() == 2
+    assert a.shape[1] == b.shape[0]
 
+    a_c = a.contiguous()
+    b_t = b.t().contiguous()  # per-col scales of B = per-row scales of B.T
 
-@triton_op("fxpr::rms_norm_fxp", mutates_args=())
-def rms_norm_fxp(
-    x: torch.Tensor,
-    weight_fp32: torch.Tensor,
-    eps: float,
-    frac_bits: int,
-    fxp_int_bits: int,
-) -> torch.Tensor:
-    x2d = x.reshape(-1, x.shape[-1]).contiguous()
-    batch, hidden = x2d.shape
-    y2d = torch.empty_like(x2d)
-    block = triton.next_power_of_2(max(hidden, 1))
-    fxp_dtype = fixed_tl_dtype(fxp_int_bits)
-    wrap_triton(_rms_norm_fxp_kernel)[(batch,)](
-        x2d,
-        weight_fp32,
-        y2d,
-        x2d, 
-        x2d.stride(0),
-        hidden,
-        eps=eps,
-        BLOCK=block,
-        FRAC_BITS=frac_bits,
-        FXP_DTYPE=fxp_dtype,
-        HAS_RESIDUAL=False,
-    )
-    return y2d.view_as(x)
+    a_scale = compute_per_row_scale(a_c, 1e-8)
+    b_scale = compute_per_row_scale(b_t, 1e-8)
 
+    a_int8 = quantise_to_int8(a_c, a_scale)
+    b_t_int8 = quantise_to_int8(b_t, b_scale)
+    b_int8 = b_t_int8.t().contiguous()
 
-@rms_norm_fxp.register_fake
-def _(x, weight_fp32, eps, frac_bits, fxp_int_bits):
-    return torch.empty_like(x)
-
-
-@triton_op("fxpr::rms_norm_fxp_residual", mutates_args=("residual",))
-def rms_norm_fxp_residual(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight_fp32: torch.Tensor,
-    eps: float,
-    frac_bits: int,
-    fxp_int_bits: int,
-) -> torch.Tensor:
-    """Fused residual + RMSNorm. residual is overwritten with x + residual (fp32)."""
-    assert x.shape == residual.shape, "x and residual must share shape"
-    x2d = x.reshape(-1, x.shape[-1]).contiguous()
-    r2d = residual.reshape(-1, residual.shape[-1])
-    if not r2d.is_contiguous():
-        r2d = r2d.contiguous()
-    batch, hidden = x2d.shape
-    y2d = torch.empty_like(x2d)
-    block = triton.next_power_of_2(max(hidden, 1))
-    fxp_dtype = fixed_tl_dtype(fxp_int_bits)
-    wrap_triton(_rms_norm_fxp_kernel)[(batch,)](
-        x2d,
-        weight_fp32,
-        y2d,
-        r2d,
-        x2d.stride(0),
-        hidden,
-        eps=eps,
-        BLOCK=block,
-        FRAC_BITS=frac_bits,
-        FXP_DTYPE=fxp_dtype,
-        HAS_RESIDUAL=True,
-    )
-    if r2d.data_ptr() != residual.data_ptr():
-        residual.copy_(r2d.view_as(residual))
-    return y2d.view_as(x)
-
-
-@rms_norm_fxp_residual.register_fake
-def _(x, residual, weight_fp32, eps, frac_bits, fxp_int_bits):
-    return torch.empty_like(x)
+    return gemm_fxp_int8(a_int8, a_scale, b_int8, b_scale, frac_bits, fxp_int_bits)

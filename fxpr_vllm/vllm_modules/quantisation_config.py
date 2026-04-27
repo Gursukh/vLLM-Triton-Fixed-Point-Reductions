@@ -15,11 +15,18 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.layers.quantization import register_quantization_config
 
-from ..fixed_point_kernels.fixed_point import fixed_tl_dtype, int_bits_of
-from ..library_ops import gemm_fxp as gemm_fxp_op
+from ..library_ops import (
+    compute_per_row_scale,
+    gemm_fxp_int8,
+    quantise_to_int8,
+)
 from .config import DEFAULT_FRAC_BITS, get_runtime_config
 
 logger = logging.getLogger("fxpr_vllm")
+
+# Floor for the per-row scale; matches what the test suite uses and
+# avoids divide-by-zero on all-zero weight rows.
+_SCALE_EPS = 1e-8
 
 
 @register_quantization_config("fixed_point_det")
@@ -30,8 +37,7 @@ class FixedPointConfig(QuantizationConfig):
         Args:
             frac_bits: Number of fractional bits used by the GEMM accumulator.
         """
-        fxp_dtype = fixed_tl_dtype(get_runtime_config().fxp_int_bits)
-        int_bits = int_bits_of(fxp_dtype)
+        int_bits = get_runtime_config().fxp_int_bits
         if not isinstance(frac_bits, int) or not (0 <= frac_bits < int_bits):
             raise ValueError(
                 f"frac_bits must be an int in [0, {int_bits}); got {frac_bits!r}"
@@ -55,7 +61,7 @@ class FixedPointConfig(QuantizationConfig):
     @classmethod
     def get_min_capability(cls) -> int:
         """Return the minimum CUDA compute capability (major * 10 + minor)."""
-        return 70
+        return 75
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -80,15 +86,7 @@ class FixedPointConfig(QuantizationConfig):
         layer: nn.Module,
         prefix: str,
     ) -> "QuantizeMethodBase | None":
-        """Return a :class:`FixedPointLinearMethod` for linear layers, else None.
-
-        Args:
-            layer:  The module being quantised.
-            prefix: Qualified name of the layer within the model (unused).
-
-        Returns:
-            A linear-method wrapper for :class:`LinearBase` layers, else None so vLLM uses its default.
-        """
+        """Return a :class:`FixedPointLinearMethod` for linear layers, else None."""
         if isinstance(layer, LinearBase):
             return FixedPointLinearMethod(self)
         return None
@@ -100,14 +98,9 @@ class FixedPointConfig(QuantizationConfig):
 
 class FixedPointLinearMethod(QuantizeMethodBase):
     def __init__(self, config: FixedPointConfig) -> None:
-        """Bind this linear method to its parent quantisation config.
-
-        Args:
-            config: The :class:`FixedPointConfig` providing frac_bits.
-        """
+        """Bind this linear method to its parent quantisation config."""
         self.config = config
-        # Cache once at construction time; the runtime config is process-global
-        # and does not change after plugin registration.
+        # Cache once at construction time; the runtime config is process-global.
         self.fxp_int_bits = get_runtime_config().fxp_int_bits
 
     def create_weights(
@@ -120,17 +113,7 @@ class FixedPointLinearMethod(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs: Any,
     ) -> None:
-        """Allocate a weight parameter of shape (sum(output_partition_sizes), input_size_per_partition).
-
-        Args:
-            layer:                    Linear layer receiving the parameter.
-            input_size_per_partition: Input features on this tensor-parallel shard.
-            output_partition_sizes:   Output features per fused shard; summed to form the weight's first dim.
-            input_size:               Full input feature count (unused; kept for the vLLM API).
-            output_size:              Full output feature count (unused).
-            params_dtype:             Dtype of the allocated weight.
-            **extra_weight_attrs:     Extra loader hooks; weight_loader is forwarded to :class:`ModelWeightParameter`.
-        """
+        """Allocate a weight parameter of shape (sum(output_partition_sizes), input_size_per_partition)."""
         total_output_size = sum(output_partition_sizes)
 
         weight = ModelWeightParameter(
@@ -146,17 +129,34 @@ class FixedPointLinearMethod(QuantizeMethodBase):
         layer.register_parameter("weight", weight)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        """Pre-transpose the weight once after checkpoint loading and free the original.
+        """Quantise the weight to int8 + per-output-feature fp16 scale.
 
-        Attaches layer.weight_t of shape (input_size_per_partition, total_output_size).
-        Weights are kept in bfloat16 (matching checkpoint precision); the GEMM kernel
-        widens to fp32 internally via tl.load(...).to(tl.float32). The original
-        layer.weight is dereferenced to recover HBM.
+        After this runs, the layer carries:
+            layer.weight_int8 : (input_size, output_size) int8
+            layer.weight_scale: (output_size,) fp16
+
+        weight_int8 is the transpose of the original weight (so apply()
+        can call a @ weight_int8 with shape (M, K) @ (K, N)). The
+        per-row scale of the weight transpose corresponds to per-output
+        feature, computed before the kernel sees any K-partition. This
+        matches the split-invariance contract from Migrate.md E.
         """
         with torch.no_grad():
-            w_t = layer.weight.data.to(torch.bfloat16).t().contiguous()
-        layer.weight_t = w_t
-        # Free the original weight; weight_t is the only copy we need.
+            # Original weight is (output_size, input_size). Transpose so
+            # the GEMM contracts along K = input_size: w_t shape
+            # (input_size, output_size).
+            w = layer.weight.data.to(torch.float32)
+            w_t = w.t().contiguous()
+            # Per-output-feature scale = per-row scale of w (== per-col of w_t).
+            scale = compute_per_row_scale(w, _SCALE_EPS)
+            # Quantise w (per-row) then transpose; equivalent to
+            # quantising w_t (per-col), but lets us reuse the per-row helper.
+            w_int8_rows = quantise_to_int8(w, scale)
+            w_int8 = w_int8_rows.t().contiguous()
+
+        layer.weight_int8 = w_int8
+        layer.weight_scale = scale
+        # Free the original weight; weight_int8 + weight_scale replace it.
         del layer.weight
         layer.register_parameter("weight", None)
 
@@ -166,19 +166,27 @@ class FixedPointLinearMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the deterministic fixed-point GEMM for this linear layer."""
+        """Run int8 GEMM with per-token activation scale and per-output weight scale."""
         orig_dtype = x.dtype
-        w_t = layer.weight_t
 
-        # Cast input to match weight dtype; the GEMM kernel widens both to fp32
-        # internally, so no precision is lost relative to the original fp32 path.
         x2d = x.reshape(-1, x.shape[-1])
-        if x2d.dtype != w_t.dtype:
-            x2d = x2d.to(w_t.dtype)
+        # Activation -> fp32 -> per-row scale -> int8.
+        if x2d.dtype != torch.float32:
+            x2d = x2d.to(torch.float32)
         if not x2d.is_contiguous():
             x2d = x2d.contiguous()
 
-        out = gemm_fxp_op(x2d, w_t, self.config.frac_bits, self.fxp_int_bits)
+        a_scale = compute_per_row_scale(x2d, _SCALE_EPS)
+        a_int8 = quantise_to_int8(x2d, a_scale)
+
+        out = gemm_fxp_int8(
+            a_int8,
+            a_scale,
+            layer.weight_int8,
+            layer.weight_scale,
+            self.config.frac_bits,
+            self.fxp_int_bits,
+        )
         out = out.view(*x.shape[:-1], out.shape[-1])
 
         if bias is not None:
