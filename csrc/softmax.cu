@@ -1,17 +1,14 @@
-// Per-row deterministic log-softmax via fixed-point exp sum.
-//
-// One CTA per row; three passes over the row:
-//   1. row_max   -> fp32 max via warp+block shuffle (max is order-invariant).
-//   2. exp_sum   -> per-thread exp(x-row_max), quantise to int, integer sum.
-//   3. y = (x - row_max) - log(int_to_float(int_sum)).
-//
-// Determinism: the only sum is integer; max/log are single ops per output.
+// Per-row deterministic log-softmax via fixed-point exp sum. One CTA
+// per row; three passes: row_max -> integer-sum exp(x - row_max) ->
+// y = (x - row_max) - log(sum). Only summation is integer; max/log
+// are single ops per output.
 
 #include "fixed_point.cuh"
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 
 #include <cmath>
 #include <limits>
@@ -133,6 +130,7 @@ void launch(
       y_2d.stride(0),
       N,
       static_cast<int>(frac_bits));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace

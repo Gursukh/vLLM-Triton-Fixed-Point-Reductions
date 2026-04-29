@@ -1,19 +1,13 @@
-// RMSNorm with deterministic fixed-point sum of squares.
-//
-// One CTA per row. Each thread reduces a strided slice of the row into
-// a per-thread fixed-point partial sum; partials are merged via
-// warp-shuffle integer adds and shared-memory cross-warp adds. Integer
-// addition is associative, so the partition does not affect the result.
-//
-// The fused-residual variant adds residual into x in fp32 in-place,
-// stores the new residual back, and uses the summed value for the norm.
-// The fp32 add is one op per element so it is bitwise reproducible.
+// RMSNorm with deterministic fixed-point sum of squares. One CTA per
+// row; warp-shuffle + shared-memory integer reduction (associative).
+// Fused-residual variant does residual += x in fp32 in place.
 
 #include "fixed_point.cuh"
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 
 namespace fxpr {
 
@@ -22,10 +16,12 @@ namespace {
 constexpr int kMaxThreads = 1024;
 constexpr int kWarpSize = 32;
 
+// Cap on the pass-1 → pass-2 smem cache. Sized to stay under the 48KB
+// per-CTA budget on every supported arch.
+constexpr int kSmemCacheElems = 8192;
+
 template <typename FxpInt>
 __device__ __forceinline__ FxpInt warp_reduce_sum(FxpInt v) {
-  // Tree-reduce within the warp. Integer add is associative so the
-  // tree shape doesn't change the result.
   for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
     v += __shfl_xor_sync(0xFFFFFFFFu, v, offset);
   }
@@ -50,28 +46,30 @@ __global__ void rms_norm_kernel(
   float* y_row = y + row * stride_x;
   float* r_row = kHasResidual ? residual + row * stride_x : nullptr;
 
-  // Pass 1: per-thread fixed-point partial sum of squares.
-  // We re-load x in pass 2 to write y; the residual fusion writes the
-  // new residual once in pass 1, so the input data only needs to flow
-  // through global memory twice (same as the Triton path).
+  // Stage x (post-residual when fused) into smem when it fits, so pass 2
+  // can read from there instead of HBM. Bit-identical fallback otherwise.
+  extern __shared__ float x_cache[];
+  const bool use_cache = (hidden_size <= kSmemCacheElems);
+
+  // Pass 1: per-thread fixed-point partial sum of squares. Residual
+  // fusion writes the new residual once here, so x flows through global
+  // memory twice or once when use_cache is true.
   FxpInt partial = 0;
   for (int i = tid; i < hidden_size; i += nthreads) {
     float xi = x_row[i];
     if constexpr (kHasResidual) {
       const float ri = r_row[i];
-      // Single deterministic fp32 add per element. --fmad=false keeps
-      // this from being fused with anything downstream.
+      // The __fmul_rn in the square below blocks FMA contraction with this add.
       xi = xi + ri;
       r_row[i] = xi;
     }
+    if (use_cache) x_cache[i] = xi;
     const float xi2 = __fmul_rn(xi, xi);
     partial += float_to_fixed<FxpInt>(xi2, frac_bits);
   }
 
-  // Warp reduction.
   partial = warp_reduce_sum<FxpInt>(partial);
 
-  // Cross-warp reduction via shared memory. One slot per warp.
   __shared__ FxpInt warp_sums[kMaxThreads / kWarpSize];
   const int lane = tid & (kWarpSize - 1);
   const int warp_id = tid / kWarpSize;
@@ -82,7 +80,6 @@ __global__ void rms_norm_kernel(
   }
   __syncthreads();
 
-  // Single-warp final reduction over warp partials.
   FxpInt total;
   if (warp_id == 0) {
     FxpInt v = lane < num_warps ? warp_sums[lane] : FxpInt(0);
@@ -98,10 +95,11 @@ __global__ void rms_norm_kernel(
   const float mean_sq = fmaxf(sum_f / static_cast<float>(hidden_size), 0.0f);
   const float rrms = rsqrtf(mean_sq + eps);
 
-  // Pass 2: y = x * w * rrms (or (x + residual) * w * rrms; we already
-  // wrote the new residual in pass 1, so re-read from there).
+  // Pass 2: y = x * w * rrms.
   for (int i = tid; i < hidden_size; i += nthreads) {
-    const float xi = kHasResidual ? r_row[i] : x_row[i];
+    const float xi = use_cache
+        ? x_cache[i]
+        : (kHasResidual ? r_row[i] : x_row[i]);
     const float wi = static_cast<float>(w[i]);
     y_row[i] = xi * wi * rrms;
   }
@@ -123,8 +121,11 @@ void launch_typed(
   while (block < hidden && block < kMaxThreads) block <<= 1;
   if (block > kMaxThreads) block = kMaxThreads;
 
+  const size_t smem_bytes =
+      (hidden <= kSmemCacheElems) ? hidden * sizeof(float) : 0;
+
   auto stream = at::cuda::getCurrentCUDAStream();
-  rms_norm_kernel<FxpInt, kHasResidual, WeightT><<<batch, block, 0, stream>>>(
+  rms_norm_kernel<FxpInt, kHasResidual, WeightT><<<batch, block, smem_bytes, stream>>>(
       x_2d.data_ptr<float>(),
       w.data_ptr<WeightT>(),
       y_2d.data_ptr<float>(),
@@ -133,6 +134,7 @@ void launch_typed(
       hidden,
       static_cast<float>(eps),
       static_cast<int>(frac_bits));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <typename FxpInt, bool kHasResidual>

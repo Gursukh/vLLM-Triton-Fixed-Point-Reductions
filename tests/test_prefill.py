@@ -62,10 +62,6 @@ def _make_inputs(batch, seq_lens, num_heads, num_kv_heads, head_dim, seed=42):
     return q, k, v, o, b_start_loc, b_seq_len
 
 
-# Shared shape constants. Keeping prefill tests on a single shape lets Triton
-# reuse the same compiled kernel across the suite — head_dim and num_heads /
-# num_kv_heads are constexpr in the kernel, so varying them re-triggers a
-# multi-minute ptxas pass on small/laptop GPUs.
 _PREFILL_SEQ_LEN = 32
 _PREFILL_HEADS = 2
 _PREFILL_KV_HEADS = 2
@@ -132,7 +128,6 @@ def test_prefill_correctness_non_causal():
 @requires_cuda
 def test_prefill_variable_seq_lens():
     """Batches with different sequence lengths should each be correct."""
-    # Pad to _PREFILL_SEQ_LEN so the kernel sees a single shape signature.
     seq_lens = [_PREFILL_SEQ_LEN // 2, _PREFILL_SEQ_LEN, _PREFILL_SEQ_LEN * 3 // 4]
     q, k, v, o, b_start_loc, b_seq_len = _make_inputs(
         3, seq_lens, _PREFILL_HEADS, _PREFILL_KV_HEADS, _PREFILL_HEAD_DIM, seed=99
@@ -201,12 +196,8 @@ def _float_attention_row(
 @requires_cuda
 def test_float_accumulation_is_order_dependent():
     """fp32 attention accumulation is order-dependent (pure-torch demonstration).
-
-    The kernel-side invariance against this exact pattern is exercised by
-    test_fixedpoint_prefill_is_permutation_equivariant; keeping that
-    coverage out of this test avoids a unique kernel shape (head_dim=16,
-    num_heads=1) that would force a separate Triton compile on small GPUs.
-    """
+    The kernel-side invariance is exercised by
+    test_fixedpoint_prefill_is_permutation_equivariant."""
     seq_len, head_dim = 3, 16
     q_row = torch.ones(head_dim, device="cuda", dtype=torch.float32)
     k_rows = torch.ones(seq_len, head_dim, device="cuda", dtype=torch.float32)

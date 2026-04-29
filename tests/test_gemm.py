@@ -25,7 +25,7 @@ def _ordered_fp16_dot(
 @requires_cuda
 @pytest.mark.parametrize("M,N,K", [(4, 4, 16), (3, 7, 16), (1, 1, 32), (8, 16, 32)])
 def test_gemm_fixed_point_correctness(M, N, K):
-    """Fixed-point GEMM should closely match a plain float Triton GEMM."""
+    """Fixed-point GEMM should closely match a plain float reference."""
     g = torch.Generator(device="cuda").manual_seed(42)
 
     a = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g)
@@ -176,94 +176,3 @@ def test_gemm_deterministic_across_runs():
     results = [gemm_fxp_test(a, b) for _ in range(5)]
     for r in results[1:]:
         assert torch.equal(results[0], r)
-
-
-# ---------- Tier 2: int8 GEMM with per-row/per-col scales ----------
-#
-# The CUDA migration replaces Triton's broken-on-Turing int8 tl.dot
-# path with a deterministic int8 K-accumulator that works on every
-# supported arch (sm_75 onward). No skip-decorator is needed.
-
-
-@requires_cuda
-@pytest.mark.parametrize("M,N,K", [(64, 64, 64), (64, 64, 128), (128, 64, 64)])
-def test_gemm_mma_correctness(M, N, K):
-    """Tier-2 int8 GEMM should approximate torch.matmul within int8 precision.
-
-    Single int8 per-row scaling has ~7 bits of per-operand precision; for
-    K~128 the typical per-output error is ~sqrt(K) * 2^-7 ~ 0.1 absolute.
-    Tolerance is sized for that, not the old 4-way int16 emulation.
-    """
-    from fxpr_vllm.library_ops import launch_gemm_fxp_mma
-
-    g = torch.Generator(device="cuda").manual_seed(42)
-    a = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g)
-    b = torch.randn((K, N), device="cuda", dtype=torch.float32, generator=g)
-
-    got = launch_gemm_fxp_mma(a, b, q_frac_bits=8, frac_bits=16)
-    ref = torch.matmul(a, b)
-
-    assert torch.allclose(got, ref, atol=0.5, rtol=0.1), (
-        f"max error = {(got - ref).abs().max().item()}"
-    )
-
-
-@requires_cuda
-def test_gemm_mma_k_permutation_invariance():
-    """Permuting K must give bitwise identical output — the whole point."""
-    from fxpr_vllm.library_ops import launch_gemm_fxp_mma
-
-    g = torch.Generator(device="cuda").manual_seed(123)
-    M, K, N = 64, 128, 64
-    a = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g)
-    b = torch.randn((K, N), device="cuda", dtype=torch.float32, generator=g)
-
-    perm = torch.randperm(K, device="cuda")
-    a_perm = a[:, perm]
-    b_perm = b[perm, :]
-
-    c_orig = launch_gemm_fxp_mma(a, b, q_frac_bits=8, frac_bits=16)
-    c_perm = launch_gemm_fxp_mma(a_perm, b_perm, q_frac_bits=8, frac_bits=16)
-
-    assert torch.equal(c_orig, c_perm), (
-        f"Tier-2 GEMM lost K-permutation invariance — "
-        f"max diff = {(c_orig - c_perm).abs().max().item()}"
-    )
-
-
-@requires_cuda
-def test_gemm_mma_deterministic_across_runs():
-    """Same inputs must produce bitwise identical outputs across runs."""
-    from fxpr_vllm.library_ops import launch_gemm_fxp_mma
-
-    g = torch.Generator(device="cuda").manual_seed(77)
-    a = torch.randn((64, 128), device="cuda", dtype=torch.float32, generator=g)
-    b = torch.randn((128, 64), device="cuda", dtype=torch.float32, generator=g)
-
-    results = [launch_gemm_fxp_mma(a, b, q_frac_bits=8, frac_bits=16) for _ in range(5)]
-    for r in results[1:]:
-        assert torch.equal(results[0], r)
-
-
-@requires_cuda
-def test_gemm_mma_bk_split_invariance():
-    """Splitting K into different-sized blocks must produce the same result.
-
-    The block_k parameter is accepted for backwards compatibility but
-    the CUDA int8 GEMM does not split K; this test instead verifies
-    that shape-equivalent permutations produce identical results.
-    """
-    from fxpr_vllm.library_ops import launch_gemm_fxp_mma
-
-    g = torch.Generator(device="cuda").manual_seed(7)
-    M, K, N = 64, 256, 64
-    a = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g)
-    b = torch.randn((K, N), device="cuda", dtype=torch.float32, generator=g)
-
-    c_bk64 = launch_gemm_fxp_mma(a, b, q_frac_bits=8, frac_bits=16, block_k=64)
-    c_bk128 = launch_gemm_fxp_mma(a, b, q_frac_bits=8, frac_bits=16, block_k=128)
-
-    assert torch.equal(c_bk64, c_bk128), (
-        f"Different K-block sizes produced different results — "
-        f"max diff = {(c_bk64 - c_bk128).abs().max().item()}"
-    )

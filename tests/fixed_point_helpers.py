@@ -3,7 +3,6 @@ import torch
 
 import fxpr_vllm._cuda  # noqa: F401  (registers torch.ops.fxpr.*)
 
-
 _INT_BITS_BY_DTYPE = {
     torch.int16: 16,
     torch.int32: 32,
@@ -55,6 +54,7 @@ def prefill_fxp_test(
     is_causal: bool = True,
     softmax_scale: float | None = None,
     frac_bits: int = 14,
+    num_kv_splits: int = 8,
 ) -> None:
     """Test adapter that runs prefill via the unified paged-KV attention kernel.
 
@@ -113,5 +113,6 @@ def prefill_fxp_test(
         int(frac_bits),
         32,  # fxp_int_bits
         0.0,  # logit_softcap
-        0,    # window_size
+        0,  # window_size
+        int(num_kv_splits),
     )
