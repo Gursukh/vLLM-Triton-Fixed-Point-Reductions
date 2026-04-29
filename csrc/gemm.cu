@@ -6,13 +6,15 @@
 // per-cell K order. float4 staging changes load instructions, not math.
 
 #include "fixed_point.cuh"
+#include "ops_internal.h"
 
-#include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
 namespace fxpr {
+namespace detail {
 
 namespace {
 
@@ -233,20 +235,11 @@ void launch_tiled(
 
 }  // namespace
 
-torch::Tensor gemm_fxp_op(
-    torch::Tensor a,
-    torch::Tensor b,
+at::Tensor gemm_fxp_run(
+    at::Tensor a,
+    at::Tensor b,
     int64_t frac_bits,
     int64_t int_bits) {
-  TORCH_CHECK(a.is_cuda() && b.is_cuda(), "gemm_fxp: inputs must be CUDA");
-  TORCH_CHECK(a.scalar_type() == at::kFloat, "gemm_fxp: a must be float32");
-  TORCH_CHECK(b.scalar_type() == at::kFloat, "gemm_fxp: b must be float32");
-  TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "gemm_fxp: 2D inputs required");
-  TORCH_CHECK(a.size(1) == b.size(0),
-              "gemm_fxp: shape mismatch ", a.sizes(), " @ ", b.sizes());
-  TORCH_CHECK(int_bits == 16 || int_bits == 32 || int_bits == 64,
-              "fxp_int_bits must be 16/32/64");
-
   const c10::cuda::CUDAGuard device_guard(a.device());
   const int M = a.size(0);
   const int N = b.size(1);
@@ -261,4 +254,5 @@ torch::Tensor gemm_fxp_op(
   return c;
 }
 
+}  // namespace detail
 }  // namespace fxpr

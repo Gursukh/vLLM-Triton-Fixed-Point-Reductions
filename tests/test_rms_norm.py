@@ -60,6 +60,31 @@ def test_rms_norm_fixed_point_correctness(shape):
 
 
 @requires_cuda
+@pytest.mark.parametrize("int_bits,frac_bits", [(16, 8), (32, 16), (64, 32)])
+def test_rms_norm_parametrized_int_bits(int_bits, frac_bits):
+    """Exercise _int_dtype_for_bits across all supported (int_bits, frac_bits)."""
+    batch, hidden = 3, 16
+    g = torch.Generator(device="cuda").manual_seed(int_bits)
+
+    # Keep values small so per-element squares fit even at int_bits=16, frac_bits=8.
+    x = (
+        torch.rand((batch, hidden), device="cuda", dtype=torch.float32, generator=g)
+        - 0.5
+    )
+    w = (
+        torch.rand((hidden,), device="cuda", dtype=torch.float32, generator=g) - 0.5
+    ) * 2.0
+
+    got = torch.ops.fxpr.rms_norm_fxp(x, w, 1e-6, frac_bits, int_bits)
+    ref = _run_rms_norm_float_kernel(x, w, eps=1e-6)
+
+    assert torch.allclose(got, ref, atol=5e-2, rtol=5e-2), (
+        f"max error = {(got - ref).abs().max().item()} "
+        f"at int_bits={int_bits} frac_bits={frac_bits}"
+    )
+
+
+@requires_cuda
 def test_rms_norm_associativity_fixed_vs_float16():
     # Squares are [4096, 1, 1, 1, 1], which produce order-dependent fp16 sums:
     # ((4096 + 1) + 1 + 1 + 1) -> 4096, but (1 + 1 + 1 + 1 + 4096) -> 4100.

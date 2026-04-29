@@ -4,8 +4,9 @@
 // are single ops per output.
 
 #include "fixed_point.cuh"
+#include "ops_internal.h"
 
-#include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -14,6 +15,7 @@
 #include <limits>
 
 namespace fxpr {
+namespace detail {
 
 namespace {
 
@@ -135,14 +137,10 @@ void launch(
 
 }  // namespace
 
-torch::Tensor log_softmax_fxp_op(
-    torch::Tensor x,
+at::Tensor log_softmax_fxp_run(
+    at::Tensor x,
     int64_t frac_bits,
     int64_t int_bits) {
-  TORCH_CHECK(x.is_cuda(), "log_softmax_fxp: input must be CUDA");
-  TORCH_CHECK(int_bits == 16 || int_bits == 32 || int_bits == 64,
-              "fxp_int_bits must be 16/32/64");
-
   const c10::cuda::CUDAGuard device_guard(x.device());
   const auto orig_dtype = x.scalar_type();
   auto x_f32 = x.to(at::kFloat).contiguous();
@@ -160,4 +158,5 @@ torch::Tensor log_softmax_fxp_op(
   return y;
 }
 
+}  // namespace detail
 }  // namespace fxpr

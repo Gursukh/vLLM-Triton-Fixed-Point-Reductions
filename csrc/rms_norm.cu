@@ -3,13 +3,15 @@
 // Fused-residual variant does residual += x in fp32 in place.
 
 #include "fixed_point.cuh"
+#include "ops_internal.h"
 
-#include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
 namespace fxpr {
+namespace detail {
 
 namespace {
 
@@ -176,24 +178,6 @@ at::Tensor rms_norm_dispatch(
     double eps,
     int64_t frac_bits,
     int64_t int_bits) {
-  TORCH_CHECK(x.is_cuda(), "rms_norm: x must be CUDA");
-  TORCH_CHECK(w.is_cuda(), "rms_norm: w must be CUDA");
-  TORCH_CHECK(x.scalar_type() == at::kFloat, "rms_norm: x must be float32");
-  TORCH_CHECK(
-      w.scalar_type() == at::kFloat || w.scalar_type() == at::kHalf
-          || w.scalar_type() == at::kBFloat16,
-      "rms_norm: w must be float32 / float16 / bfloat16");
-  TORCH_CHECK(int_bits == 16 || int_bits == 32 || int_bits == 64,
-              "fxp_int_bits must be 16/32/64");
-  if constexpr (kHasResidual) {
-    TORCH_CHECK(residual != nullptr && residual->is_cuda(),
-                "rms_norm: residual must be CUDA");
-    TORCH_CHECK(residual->scalar_type() == at::kFloat,
-                "rms_norm: residual must be float32");
-    TORCH_CHECK(residual->sizes() == x.sizes(),
-                "rms_norm: residual must have the same shape as x");
-  }
-
   const c10::cuda::CUDAGuard device_guard(x.device());
   auto x_2d = as_2d(x).contiguous();
   auto y_2d = at::empty_like(x_2d);
@@ -230,9 +214,9 @@ at::Tensor rms_norm_dispatch(
 
 }  // namespace
 
-torch::Tensor rms_norm_fxp_op(
-    torch::Tensor x,
-    torch::Tensor w,
+at::Tensor rms_norm_fxp_run(
+    at::Tensor x,
+    at::Tensor w,
     double eps,
     int64_t frac_bits,
     int64_t int_bits) {
@@ -240,10 +224,10 @@ torch::Tensor rms_norm_fxp_op(
       std::move(x), nullptr, std::move(w), eps, frac_bits, int_bits);
 }
 
-torch::Tensor rms_norm_fxp_residual_op(
-    torch::Tensor x,
-    torch::Tensor residual,
-    torch::Tensor w,
+at::Tensor rms_norm_fxp_residual_run(
+    at::Tensor x,
+    at::Tensor residual,
+    at::Tensor w,
     double eps,
     int64_t frac_bits,
     int64_t int_bits) {
@@ -251,4 +235,5 @@ torch::Tensor rms_norm_fxp_residual_op(
       std::move(x), &residual, std::move(w), eps, frac_bits, int_bits);
 }
 
+}  // namespace detail
 }  // namespace fxpr

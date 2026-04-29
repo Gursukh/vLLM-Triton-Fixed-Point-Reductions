@@ -21,6 +21,7 @@ setup(
             name="fxpr_vllm._cuda",
             sources=[
                 "csrc/bindings.cpp",
+                "csrc/ops.cpp",
                 "csrc/casts.cu",
                 "csrc/rms_norm.cu",
                 "csrc/softmax.cu",

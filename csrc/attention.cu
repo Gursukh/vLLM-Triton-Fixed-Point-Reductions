@@ -11,8 +11,9 @@
 // split_index), independent of scheduling.
 
 #include "fixed_point.cuh"
+#include "ops_internal.h"
 
-#include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -21,6 +22,7 @@
 #include <cmath>
 
 namespace fxpr {
+namespace detail {
 
 namespace {
 
@@ -613,15 +615,15 @@ void launch_attention(
 
 }  // namespace
 
-void unified_attention_fxp_op(
-    torch::Tensor q,
-    torch::Tensor kv_cache,
-    torch::Tensor o,
-    torch::Tensor query_start_loc,
-    torch::Tensor seq_lens,
-    torch::Tensor block_table,
+void unified_attention_fxp_run(
+    at::Tensor q,
+    at::Tensor kv_cache,
+    at::Tensor o,
+    at::Tensor query_start_loc,
+    at::Tensor seq_lens,
+    at::Tensor block_table,
     int64_t max_query_len,
-    c10::optional<torch::Tensor> alibi_slopes,
+    c10::optional<at::Tensor> alibi_slopes,
     bool is_causal,
     c10::optional<double> softmax_scale,
     int64_t frac_bits,
@@ -629,32 +631,6 @@ void unified_attention_fxp_op(
     double logit_softcap,
     int64_t window_size,
     int64_t num_kv_splits) {
-  TORCH_CHECK(q.is_cuda() && kv_cache.is_cuda() && o.is_cuda(),
-              "unified_attention_fxp: all tensors must be CUDA");
-  TORCH_CHECK(query_start_loc.is_cuda() && seq_lens.is_cuda() &&
-                  block_table.is_cuda(),
-              "unified_attention_fxp: metadata tensors must be CUDA");
-  TORCH_CHECK(kv_cache.dim() == 5 && kv_cache.size(1) == 2,
-              "kv_cache must be (num_blocks, 2, page_size, num_kv_heads, head_dim)");
-  TORCH_CHECK(
-      q.scalar_type() == at::kFloat || q.scalar_type() == at::kHalf ||
-          q.scalar_type() == at::kBFloat16,
-      "q dtype must be float32 / float16 / bfloat16");
-  TORCH_CHECK(kv_cache.scalar_type() == q.scalar_type(),
-              "kv_cache dtype must match q dtype");
-  TORCH_CHECK(o.scalar_type() == at::kFloat, "o must be float32");
-  TORCH_CHECK(query_start_loc.scalar_type() == at::kInt,
-              "query_start_loc must be int32, got ",
-              query_start_loc.scalar_type());
-  TORCH_CHECK(seq_lens.scalar_type() == at::kInt,
-              "seq_lens must be int32, got ", seq_lens.scalar_type());
-  TORCH_CHECK(block_table.scalar_type() == at::kInt,
-              "block_table must be int32, got ", block_table.scalar_type());
-  TORCH_CHECK(fxp_int_bits == 16 || fxp_int_bits == 32 || fxp_int_bits == 64,
-              "fxp_int_bits must be 16/32/64");
-  TORCH_CHECK(num_kv_splits >= 1,
-              "num_kv_splits must be >= 1, got ", num_kv_splits);
-
   const c10::cuda::CUDAGuard device_guard(q.device());
 
   // Strided K, V views the kernel uses explicit strides; .contiguous()
@@ -680,8 +656,6 @@ void unified_attention_fxp_op(
   at::Tensor alibi_holder;
   if (alibi_slopes.has_value() && alibi_slopes->numel() > 0) {
     alibi_holder = alibi_slopes->contiguous();
-    TORCH_CHECK(alibi_holder.scalar_type() == at::kFloat,
-                "alibi_slopes must be float32");
     alibi_ptr = &alibi_holder;
   }
 
@@ -731,4 +705,5 @@ void unified_attention_fxp_op(
   }
 }
 
+}  // namespace detail
 }  // namespace fxpr

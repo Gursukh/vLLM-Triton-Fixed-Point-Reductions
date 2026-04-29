@@ -1,15 +1,15 @@
 // Element-wise float<->fixed conversion ops, thin wrappers over fixed_point.cuh.
 
 #include "fixed_point.cuh"
+#include "ops_internal.h"
 
-#include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
 
 namespace fxpr {
+namespace detail {
 
 namespace {
 
@@ -87,15 +87,10 @@ void launch_x2f(const at::Tensor& x, at::Tensor& y, int frac_bits) {
 
 }  // namespace
 
-torch::Tensor float_to_fixed_op(
-    torch::Tensor x,
+at::Tensor float_to_fixed_run(
+    at::Tensor x,
     int64_t frac_bits,
     int64_t int_bits) {
-  TORCH_CHECK(x.is_cuda(), "float_to_fixed: input must be CUDA");
-  TORCH_CHECK(int_bits == 16 || int_bits == 32 || int_bits == 64,
-              "int_bits must be 16, 32, or 64");
-  TORCH_CHECK(frac_bits >= 0 && frac_bits < 127,
-              "frac_bits must be in [0, 127)");
   const c10::cuda::CUDAGuard device_guard(x.device());
   auto x_c = x.contiguous();
 
@@ -138,15 +133,10 @@ torch::Tensor float_to_fixed_op(
   return y;
 }
 
-torch::Tensor fixed_to_float_op(
-    torch::Tensor x,
+at::Tensor fixed_to_float_run(
+    at::Tensor x,
     int64_t frac_bits,
     int64_t float_bits) {
-  TORCH_CHECK(x.is_cuda(), "fixed_to_float: input must be CUDA");
-  TORCH_CHECK(float_bits == 16 || float_bits == 32 || float_bits == 64,
-              "float_bits must be 16, 32, or 64");
-  TORCH_CHECK(frac_bits >= 0 && frac_bits < 127,
-              "frac_bits must be in [0, 127)");
   const c10::cuda::CUDAGuard device_guard(x.device());
   auto x_c = x.contiguous();
 
@@ -189,4 +179,5 @@ torch::Tensor fixed_to_float_op(
   return y;
 }
 
+}  // namespace detail
 }  // namespace fxpr

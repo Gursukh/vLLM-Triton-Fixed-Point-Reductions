@@ -167,6 +167,25 @@ def test_gemm_element_permutation_invariance():
 
 
 @requires_cuda
+@pytest.mark.parametrize("int_bits,frac_bits", [(16, 8), (32, 16), (64, 32)])
+def test_gemm_parametrized_int_bits(int_bits, frac_bits):
+    """Exercise _int_dtype_for_bits across all supported (int_bits, frac_bits)."""
+    g = torch.Generator(device="cuda").manual_seed(int_bits)
+
+    # Keep magnitudes small so partial products fit even at int_bits=16, frac_bits=8.
+    a = torch.randn((4, 16), device="cuda", dtype=torch.float32, generator=g) * 0.25
+    b = torch.randn((16, 4), device="cuda", dtype=torch.float32, generator=g) * 0.25
+
+    got = gemm_fxp_test(a, b, frac_bits=frac_bits, fxp_int_bits=int_bits)
+    ref = torch.matmul(a, b)
+
+    assert torch.allclose(got, ref, atol=5e-2, rtol=5e-2), (
+        f"max error = {(got - ref).abs().max().item()} "
+        f"at int_bits={int_bits} frac_bits={frac_bits}"
+    )
+
+
+@requires_cuda
 def test_gemm_deterministic_across_runs():
     """The same inputs must always produce bitwise identical outputs."""
     g = torch.Generator(device="cuda").manual_seed(77)
