@@ -25,7 +25,7 @@ def _ordered_fp16_dot(
 @requires_cuda
 @pytest.mark.parametrize("M,N,K", [(4, 4, 16), (3, 7, 16), (1, 1, 32), (8, 16, 32)])
 def test_gemm_fixed_point_correctness(M, N, K):
-    """Fixed-point GEMM should closely match a plain float Triton GEMM."""
+    """Fixed-point GEMM should closely match a plain float reference."""
     g = torch.Generator(device="cuda").manual_seed(42)
 
     a = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g)

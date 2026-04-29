@@ -1,30 +1,21 @@
 import torch
 
-from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.layernorm import RMSNorm
 
-from ..library_ops import rms_norm_fxp as rms_norm_fxp_op
-from ..library_ops import rms_norm_fxp_residual as rms_norm_fxp_residual_op
+from .library_ops import rms_norm_fxp as rms_norm_fxp_op
+from .library_ops import rms_norm_fxp_residual as rms_norm_fxp_residual_op
 from .config import get_runtime_config
 
 
-@CustomOp.register("rms_norm")
-@CustomOp.register_oot(name="RMSNorm")
 class DeterministicRMSNorm(RMSNorm):
     def __init__(self, *args, **kwargs) -> None:
-        """Cache the runtime fixed-point config; weight is widened in-kernel."""
         super().__init__(*args, **kwargs)
         cfg = get_runtime_config()
         self._fxp_frac_bits = cfg.frac_bits
         self._fxp_int_bits = cfg.fxp_int_bits
 
     def _det_norm_torch(self, x_fp32: torch.Tensor) -> torch.Tensor:
-        """Deterministic RMSNorm in pure torch (CPU path).
-
-        Uses the same fixed-point cast → integer sum → float pipeline as the
-        Triton kernel, so CPU and CUDA paths are bit-identical for the same
-        inputs (within fp32 rounding of the final rrms multiply).
-        """
+        """CPU reference: same fixed-point pipeline as the CUDA kernel, bit-identical."""
         frac_bits = self._fxp_frac_bits
         int_bits = self._fxp_int_bits
         int_dtype = {16: torch.int16, 32: torch.int32, 64: torch.int64}[int_bits]
@@ -45,12 +36,6 @@ class DeterministicRMSNorm(RMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Deterministic RMSNorm forward on CPU (or any non-CUDA device).
-
-        Mirrors the CUDA path's fused-residual contract. The integer sum is
-        bit-identical to the Triton kernel's reduction, so CPU determinism
-        guarantees match the CUDA path's.
-        """
         orig_dtype = x.dtype
         if residual is not None:
             new_residual = x.to(torch.float32) + residual.to(torch.float32)
@@ -64,17 +49,7 @@ class DeterministicRMSNorm(RMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Deterministic RMSNorm forward on CUDA, matching vLLM's fused-residual API.
-
-        When residual is provided the kernel performs residual += x in
-        fp32 in-place (matching vLLM's fused contract) and normalises the
-        accumulated value, returning (normalised, residual).
-
-        The kernel widens the weight via tl.load(W_ptr).to(tl.float32)
-        internally, so we pass self.weight directly without a Python-side
-        fp32 cache. The previous data_ptr()-keyed cache tripped Dynamo
-        under torch.compile (DataPtrVariable can't be isinstance'd).
-        """
+        """vLLM fused-residual API: with residual, returns (normalised, residual += x)."""
         orig_dtype = x.dtype
 
         if residual is not None:
