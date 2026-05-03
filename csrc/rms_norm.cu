@@ -31,7 +31,7 @@ __device__ __forceinline__ FxpInt warp_reduce_sum(FxpInt v) {
   return v;
 }
 
-template <typename FxpInt, bool kHasResidual, typename IOFloat>
+template <typename FxpInt, bool kHasResidual, typename IOFloat, int kFracBits>
 __global__ void rms_norm_kernel(
     const IOFloat* __restrict__ x,
     const IOFloat* __restrict__ w,
@@ -61,7 +61,7 @@ __global__ void rms_norm_kernel(
     }
     if (use_cache) x_cache[i] = xi;
     const float xi2 = xi * xi;
-    partial += float_to_fixed<FxpInt>(xi2);
+    partial += float_to_fixed<FxpInt, kFracBits>(xi2);
   }
 
   partial = warp_reduce_sum<FxpInt>(partial);
@@ -87,7 +87,7 @@ __global__ void rms_norm_kernel(
   __syncthreads();
   total = warp_sums[0];
 
-  const float sum_f = fixed_to_float<FxpInt>(total);
+  const float sum_f = fixed_to_float<FxpInt, kFracBits>(total);
   const float mean_sq = fmaxf(sum_f / static_cast<float>(hidden_size), 0.0f);
   const float rrms = rsqrtf(mean_sq + eps);
 
@@ -100,7 +100,7 @@ __global__ void rms_norm_kernel(
   }
 }
 
-template <typename FxpInt, bool kHasResidual, typename IOFloat>
+template <typename FxpInt, bool kHasResidual, typename IOFloat, int kFracBits>
 void launch_typed(
     const at::Tensor& x_2d,
     const at::Tensor& w,
@@ -119,7 +119,8 @@ void launch_typed(
       (hidden <= kSmemCacheElems) ? hidden * sizeof(float) : 0;
 
   auto stream = at::cuda::getCurrentCUDAStream();
-  rms_norm_kernel<FxpInt, kHasResidual, IOFloat><<<batch, block, smem_bytes, stream>>>(
+  rms_norm_kernel<FxpInt, kHasResidual, IOFloat, kFracBits>
+      <<<batch, block, smem_bytes, stream>>>(
       x_2d.data_ptr<IOFloat>(),
       w.data_ptr<IOFloat>(),
       y_2d.data_ptr<IOFloat>(),
@@ -130,7 +131,7 @@ void launch_typed(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <typename FxpInt, bool kHasResidual>
+template <typename FxpInt, bool kHasResidual, int kFracBits>
 void launch(
     const at::Tensor& x_2d,
     const at::Tensor& w,
@@ -143,15 +144,15 @@ void launch(
               w.scalar_type(), ", x=", x_2d.scalar_type(), ")");
   switch (x_2d.scalar_type()) {
     case at::kFloat:
-      launch_typed<FxpInt, kHasResidual, float>(
+      launch_typed<FxpInt, kHasResidual, float, kFracBits>(
           x_2d, w, y_2d, residual_2d_ptr, eps);
       break;
     case at::kHalf:
-      launch_typed<FxpInt, kHasResidual, at::Half>(
+      launch_typed<FxpInt, kHasResidual, at::Half, kFracBits>(
           x_2d, w, y_2d, residual_2d_ptr, eps);
       break;
     case at::kBFloat16:
-      launch_typed<FxpInt, kHasResidual, at::BFloat16>(
+      launch_typed<FxpInt, kHasResidual, at::BFloat16, kFracBits>(
           x_2d, w, y_2d, residual_2d_ptr, eps);
       break;
     default:
@@ -164,13 +165,35 @@ at::Tensor as_2d(const at::Tensor& x) {
   return x.reshape({-1, x.size(-1)});
 }
 
+template <bool kHasResidual, int kFracBits>
+void rms_norm_dispatch_int(
+    const at::Tensor& x_2d,
+    const at::Tensor& w,
+    at::Tensor& y_2d,
+    at::Tensor* r_2d_ptr,
+    double eps,
+    int64_t int_bits) {
+  switch (int_bits) {
+    case 16:
+      launch<int16_t, kHasResidual, kFracBits>(x_2d, w, y_2d, r_2d_ptr, eps);
+      break;
+    case 32:
+      launch<int32_t, kHasResidual, kFracBits>(x_2d, w, y_2d, r_2d_ptr, eps);
+      break;
+    case 64:
+      launch<int64_t, kHasResidual, kFracBits>(x_2d, w, y_2d, r_2d_ptr, eps);
+      break;
+  }
+}
+
 template <bool kHasResidual>
 at::Tensor rms_norm_dispatch(
     at::Tensor x,
     at::Tensor* residual,
     at::Tensor w,
     double eps,
-    int64_t int_bits) {
+    int64_t int_bits,
+    int64_t fxp_frac_bits) {
   const c10::cuda::CUDAGuard device_guard(x.device());
   auto x_2d = as_2d(x).contiguous();
   auto y_2d = at::empty_like(x_2d);
@@ -184,15 +207,18 @@ at::Tensor rms_norm_dispatch(
     r_2d_ptr = &r_2d_storage;
   }
 
-  switch (int_bits) {
+  switch (fxp_frac_bits) {
+    case 8:
+      rms_norm_dispatch_int<kHasResidual, 8>(x_2d, w, y_2d, r_2d_ptr, eps,
+                                             int_bits);
+      break;
     case 16:
-      launch<int16_t, kHasResidual>(x_2d, w, y_2d, r_2d_ptr, eps);
+      rms_norm_dispatch_int<kHasResidual, 16>(x_2d, w, y_2d, r_2d_ptr, eps,
+                                              int_bits);
       break;
     case 32:
-      launch<int32_t, kHasResidual>(x_2d, w, y_2d, r_2d_ptr, eps);
-      break;
-    case 64:
-      launch<int64_t, kHasResidual>(x_2d, w, y_2d, r_2d_ptr, eps);
+      rms_norm_dispatch_int<kHasResidual, 32>(x_2d, w, y_2d, r_2d_ptr, eps,
+                                              int_bits);
       break;
   }
 
@@ -211,9 +237,10 @@ at::Tensor rms_norm_fxp_run(
     at::Tensor x,
     at::Tensor w,
     double eps,
-    int64_t int_bits) {
+    int64_t int_bits,
+    int64_t fxp_frac_bits) {
   return rms_norm_dispatch<false>(
-      std::move(x), nullptr, std::move(w), eps, int_bits);
+      std::move(x), nullptr, std::move(w), eps, int_bits, fxp_frac_bits);
 }
 
 at::Tensor rms_norm_fxp_residual_run(
@@ -221,9 +248,10 @@ at::Tensor rms_norm_fxp_residual_run(
     at::Tensor residual,
     at::Tensor w,
     double eps,
-    int64_t int_bits) {
+    int64_t int_bits,
+    int64_t fxp_frac_bits) {
   return rms_norm_dispatch<true>(
-      std::move(x), &residual, std::move(w), eps, int_bits);
+      std::move(x), &residual, std::move(w), eps, int_bits, fxp_frac_bits);
 }
 
 }  // namespace detail

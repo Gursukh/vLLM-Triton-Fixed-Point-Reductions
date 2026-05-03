@@ -19,7 +19,9 @@ def deterministic_log_softmax(
     else:
         transposed = False
 
-    out = torch.ops.fxpr.log_softmax_fxp(logits, int(cfg.fxp_int_bits))
+    out = torch.ops.fxpr.log_softmax_fxp(
+        logits, int(cfg.fxp_int_bits), int(cfg.fxp_frac_bits)
+    )
     if transposed:
         out = out.transpose(dim, -1).contiguous()
     return out

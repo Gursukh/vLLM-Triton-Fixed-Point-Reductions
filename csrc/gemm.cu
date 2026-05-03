@@ -106,16 +106,16 @@ namespace fxpr
 
       // ----- Per-dtype fixed-point conversion -----------------------------------
 
-      template <typename FxpInt, typename Acc>
+      template <typename FxpInt, typename Acc, int kFracBits>
       __device__ __forceinline__ FxpInt acc_to_fixed(Acc x)
       {
         if constexpr (std::is_same_v<Acc, __half>)
         {
-          return half_to_fixed<FxpInt>(x);
+          return half_to_fixed<FxpInt, kFracBits>(x);
         }
         else
         {
-          return float_to_fixed<FxpInt>(x);
+          return float_to_fixed<FxpInt, kFracBits>(x);
         }
       }
 
@@ -247,7 +247,7 @@ namespace fxpr
       // Body is templated on (FxpInt, IOFloat). The sm_75 path discards the
       // bf16/TF32 branches via `if constexpr` so they're never instantiated.
 
-      template <typename FxpInt, typename IOFloat>
+      template <typename FxpInt, typename IOFloat, int kFracBits>
       __device__ void gemm_body(
           const IOFloat *__restrict__ a,
           const IOFloat *__restrict__ b,
@@ -369,7 +369,7 @@ namespace fxpr
 #pragma unroll
               for (int i = 0; i < kFragElems; ++i)
               {
-                acc_fxp[wm][wn][i] += acc_to_fixed<FxpInt, Acc>(d_frag[wm][wn].x[i]);
+                acc_fxp[wm][wn][i] += acc_to_fixed<FxpInt, Acc, kFracBits>(d_frag[wm][wn].x[i]);
               }
             }
           }
@@ -387,7 +387,7 @@ namespace fxpr
 #pragma unroll
             for (int i = 0; i < kFragElems; ++i)
             {
-              const float v = fixed_to_float<FxpInt>(acc_fxp[wm][wn][i]);
+              const float v = fixed_to_float<FxpInt, kFracBits>(acc_fxp[wm][wn][i]);
               out_frag.x[i] = float_to_acc<Acc>(v);
             }
             wmma::store_matrix_sync(&C_buf[warp_id][0], out_frag, FN,
@@ -418,7 +418,7 @@ namespace fxpr
         }
       }
 
-      template <typename FxpInt, typename IOFloat>
+      template <typename FxpInt, typename IOFloat, int kFracBits>
       __global__ void gemm_kernel_tc(
           const IOFloat *__restrict__ a,
           const IOFloat *__restrict__ b,
@@ -433,9 +433,9 @@ namespace fxpr
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
         if constexpr (kIsFp16)
         {
-          gemm_body<FxpInt, IOFloat>(a, b, bias, c, M, N, K,
-                                     stride_am, stride_ak, stride_bk, stride_bn,
-                                     stride_cm, stride_cn);
+          gemm_body<FxpInt, IOFloat, kFracBits>(a, b, bias, c, M, N, K,
+                                                stride_am, stride_ak, stride_bk, stride_bn,
+                                                stride_cm, stride_cn);
         }
         else
         {
@@ -443,9 +443,9 @@ namespace fxpr
           __trap();
         }
 #else
-        gemm_body<FxpInt, IOFloat>(a, b, bias, c, M, N, K,
-                                   stride_am, stride_ak, stride_bk, stride_bn,
-                                   stride_cm, stride_cn);
+        gemm_body<FxpInt, IOFloat, kFracBits>(a, b, bias, c, M, N, K,
+                                              stride_am, stride_ak, stride_bk, stride_bn,
+                                              stride_cm, stride_cn);
 #endif
       }
 
@@ -482,7 +482,7 @@ namespace fxpr
         return reinterpret_cast<const IOFloat *>(t.data_ptr<Aten>());
       }
 
-      template <typename FxpInt, typename IOFloat>
+      template <typename FxpInt, typename IOFloat, int kFracBits>
       void launch_typed(
           const at::Tensor &a, const at::Tensor &b,
           const c10::optional<at::Tensor> &bias, at::Tensor &c)
@@ -501,7 +501,7 @@ namespace fxpr
                                       : nullptr;
 
         auto stream = at::cuda::getCurrentCUDAStream();
-        gemm_kernel_tc<FxpInt, IOFloat><<<grid, block, 0, stream>>>(
+        gemm_kernel_tc<FxpInt, IOFloat, kFracBits><<<grid, block, 0, stream>>>(
             native_ptr<IOFloat>(a), native_ptr<IOFloat>(b),
             bias_ptr, native_ptr<IOFloat>(c),
             M, N, K,
@@ -511,7 +511,7 @@ namespace fxpr
         C10_CUDA_KERNEL_LAUNCH_CHECK();
       }
 
-      template <typename FxpInt>
+      template <typename FxpInt, int kFracBits>
       void launch_tiled(
           const at::Tensor &a, const at::Tensor &b,
           const c10::optional<at::Tensor> &bias, at::Tensor &c)
@@ -519,16 +519,35 @@ namespace fxpr
         switch (a.scalar_type())
         {
         case at::kFloat:
-          launch_typed<FxpInt, float>(a, b, bias, c);
+          launch_typed<FxpInt, float, kFracBits>(a, b, bias, c);
           break;
         case at::kHalf:
-          launch_typed<FxpInt, __half>(a, b, bias, c);
+          launch_typed<FxpInt, __half, kFracBits>(a, b, bias, c);
           break;
         case at::kBFloat16:
-          launch_typed<FxpInt, __nv_bfloat16>(a, b, bias, c);
+          launch_typed<FxpInt, __nv_bfloat16, kFracBits>(a, b, bias, c);
           break;
         default:
           TORCH_CHECK(false, "gemm_fxp: unsupported input dtype ", a.scalar_type());
+        }
+      }
+
+      template <int kFracBits>
+      void gemm_dispatch_int(const at::Tensor &a, const at::Tensor &b,
+                             const c10::optional<at::Tensor> &bias,
+                             at::Tensor &c, int64_t int_bits)
+      {
+        switch (int_bits)
+        {
+        case 16:
+          launch_tiled<int16_t, kFracBits>(a, b, bias, c);
+          break;
+        case 32:
+          launch_tiled<int32_t, kFracBits>(a, b, bias, c);
+          break;
+        case 64:
+          launch_tiled<int64_t, kFracBits>(a, b, bias, c);
+          break;
         }
       }
 
@@ -538,7 +557,8 @@ namespace fxpr
         at::Tensor a,
         at::Tensor b,
         c10::optional<at::Tensor> bias,
-        int64_t int_bits)
+        int64_t int_bits,
+        int64_t fxp_frac_bits)
     {
       const c10::cuda::CUDAGuard device_guard(a.device());
       const int M = a.size(0);
@@ -546,16 +566,16 @@ namespace fxpr
 
       auto c = at::empty({M, N}, a.options());
 
-      switch (int_bits)
+      switch (fxp_frac_bits)
       {
+      case 8:
+        gemm_dispatch_int<8>(a, b, bias, c, int_bits);
+        break;
       case 16:
-        launch_tiled<int16_t>(a, b, bias, c);
+        gemm_dispatch_int<16>(a, b, bias, c, int_bits);
         break;
       case 32:
-        launch_tiled<int32_t>(a, b, bias, c);
-        break;
-      case 64:
-        launch_tiled<int64_t>(a, b, bias, c);
+        gemm_dispatch_int<32>(a, b, bias, c, int_bits);
         break;
       }
       return c;

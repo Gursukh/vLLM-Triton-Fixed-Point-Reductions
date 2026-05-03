@@ -38,7 +38,7 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
   return v;
 }
 
-template <typename FxpInt, typename IOFloat>
+template <typename FxpInt, typename IOFloat, int kFracBits>
 __global__ void log_softmax_kernel(
     const IOFloat* __restrict__ x,
     IOFloat* __restrict__ y,
@@ -83,7 +83,7 @@ __global__ void log_softmax_kernel(
   for (int i = tid; i < N; i += nthreads) {
     const float xi = static_cast<float>(x_row[i]);
     const float ei = expf(xi - row_max);
-    partial_sum += float_to_fixed<FxpInt>(ei);
+    partial_sum += float_to_fixed<FxpInt, kFracBits>(ei);
   }
   partial_sum = warp_reduce_sum<FxpInt>(partial_sum);
 
@@ -94,7 +94,7 @@ __global__ void log_softmax_kernel(
     FxpInt v = lane < num_warps ? warp_sum[lane] : FxpInt(0);
     v = warp_reduce_sum<FxpInt>(v);
     if (lane == 0) {
-      const float sum_f = fixed_to_float<FxpInt>(v);
+      const float sum_f = fixed_to_float<FxpInt, kFracBits>(v);
       log_sum_s = logf(sum_f);
     }
   }
@@ -108,7 +108,7 @@ __global__ void log_softmax_kernel(
   }
 }
 
-template <typename FxpInt, typename IOFloat>
+template <typename FxpInt, typename IOFloat, int kFracBits>
 void launch_typed(
     const at::Tensor& x_2d,
     at::Tensor& y_2d) {
@@ -121,7 +121,7 @@ void launch_typed(
   if (block > kMaxThreads) block = kMaxThreads;
 
   auto stream = at::cuda::getCurrentCUDAStream();
-  log_softmax_kernel<FxpInt, IOFloat><<<rows, block, 0, stream>>>(
+  log_softmax_kernel<FxpInt, IOFloat, kFracBits><<<rows, block, 0, stream>>>(
       x_2d.data_ptr<IOFloat>(),
       y_2d.data_ptr<IOFloat>(),
       x_2d.stride(0),
@@ -130,19 +130,19 @@ void launch_typed(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <typename FxpInt>
+template <typename FxpInt, int kFracBits>
 void launch(
     const at::Tensor& x_2d,
     at::Tensor& y_2d) {
   switch (x_2d.scalar_type()) {
     case at::kFloat:
-      launch_typed<FxpInt, float>(x_2d, y_2d);
+      launch_typed<FxpInt, float, kFracBits>(x_2d, y_2d);
       break;
     case at::kHalf:
-      launch_typed<FxpInt, at::Half>(x_2d, y_2d);
+      launch_typed<FxpInt, at::Half, kFracBits>(x_2d, y_2d);
       break;
     case at::kBFloat16:
-      launch_typed<FxpInt, at::BFloat16>(x_2d, y_2d);
+      launch_typed<FxpInt, at::BFloat16, kFracBits>(x_2d, y_2d);
       break;
     default:
       TORCH_CHECK(false, "log_softmax: unsupported input dtype ",
@@ -150,20 +150,31 @@ void launch(
   }
 }
 
+template <int kFracBits>
+void log_softmax_dispatch_int(const at::Tensor& x_2d, at::Tensor& y_2d,
+                              int64_t int_bits) {
+  switch (int_bits) {
+    case 16: launch<int16_t, kFracBits>(x_2d, y_2d); break;
+    case 32: launch<int32_t, kFracBits>(x_2d, y_2d); break;
+    case 64: launch<int64_t, kFracBits>(x_2d, y_2d); break;
+  }
+}
+
 }  // namespace
 
 at::Tensor log_softmax_fxp_run(
     at::Tensor x,
-    int64_t int_bits) {
+    int64_t int_bits,
+    int64_t fxp_frac_bits) {
   const c10::cuda::CUDAGuard device_guard(x.device());
   auto x_c = x.contiguous();
   auto x_2d = x_c.reshape({-1, x_c.size(-1)}).contiguous();
   auto y_2d = at::empty_like(x_2d);
 
-  switch (int_bits) {
-    case 16: launch<int16_t>(x_2d, y_2d); break;
-    case 32: launch<int32_t>(x_2d, y_2d); break;
-    case 64: launch<int64_t>(x_2d, y_2d); break;
+  switch (fxp_frac_bits) {
+    case 8:  log_softmax_dispatch_int<8>(x_2d, y_2d, int_bits);  break;
+    case 16: log_softmax_dispatch_int<16>(x_2d, y_2d, int_bits); break;
+    case 32: log_softmax_dispatch_int<32>(x_2d, y_2d, int_bits); break;
   }
 
   return y_2d.view(x_c.sizes());

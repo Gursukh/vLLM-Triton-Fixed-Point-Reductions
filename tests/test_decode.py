@@ -55,6 +55,7 @@ def _run_decode(q, kv_cache, query_start_loc, seq_lens, block_table, num_kv_spli
         True,
         float(_SM_SCALE),
         32,
+        16,
         0.0,
         0,
         int(num_kv_splits),

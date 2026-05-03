@@ -144,6 +144,7 @@ class DeterministicAttentionImpl(AttentionImpl):
         self.window_size = int(sliding_window) if sliding_window else 0
         self.attn_type = attn_type
         self.fxp_int_bits = cfg.fxp_int_bits
+        self.fxp_frac_bits = cfg.fxp_frac_bits
         self.num_kv_splits = cfg.num_kv_splits
 
         if alibi_slopes is not None:
@@ -221,6 +222,7 @@ class DeterministicAttentionImpl(AttentionImpl):
             True,
             float(self.scale),
             int(self.fxp_int_bits),
+            int(self.fxp_frac_bits),
             float(self.logits_soft_cap),
             int(self.window_size),
             int(self.num_kv_splits),

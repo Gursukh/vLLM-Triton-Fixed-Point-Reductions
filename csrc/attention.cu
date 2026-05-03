@@ -90,12 +90,12 @@ __device__ __forceinline__ void compute_chunk(
 }
 
 // Shared between both passes so qk_post matches per key.
-template <typename FxpInt>
+template <typename FxpInt, int kFracBits>
 __device__ __forceinline__ float post_process_qk(
     FxpInt qk_fxp,
     float softmax_scale_log2, float logit_softcap,
     float alibi_slope, int kp, int q_abs_pos) {
-  float qk = fixed_to_float<FxpInt>(qk_fxp);
+  float qk = fixed_to_float<FxpInt, kFracBits>(qk_fxp);
   qk = qk * softmax_scale_log2;
   if (logit_softcap > 0.0f) {
     const float softcap_log2 = logit_softcap * kRcpLn2;
@@ -105,7 +105,7 @@ __device__ __forceinline__ float post_process_qk(
   return qk;
 }
 
-template <typename FxpInt, typename IOFloat>
+template <typename FxpInt, typename IOFloat, int kFracBits>
 __global__ void attn_split_max_kernel(
     const IOFloat* __restrict__ Q,                  // (T, H, D)
     const IOFloat* __restrict__ K_cache,            // (B, page_size, H_kv, D)
@@ -187,11 +187,11 @@ __global__ void attn_split_max_kernel(
     for (int d = tid; d < head_dim; d += nthreads) {
       const float qd = static_cast<float>(q_smem[d]);
       const float kd = static_cast<float>(k_row[d]);
-      partial += float_to_fixed<FxpInt>(qd * kd);
+      partial += float_to_fixed<FxpInt, kFracBits>(qd * kd);
     }
     partial = block_reduce_sum<FxpInt>(partial, shm_int);
 
-    const float qk = post_process_qk<FxpInt>(
+    const float qk = post_process_qk<FxpInt, kFracBits>(
         partial, softmax_scale_log2, logit_softcap,
         alibi_slope, kp, q_abs_pos);
     row_max = fmaxf(row_max, qk);
@@ -204,7 +204,7 @@ __global__ void attn_split_max_kernel(
   }
 }
 
-template <typename FxpInt, typename IOFloat>
+template <typename FxpInt, typename IOFloat, int kFracBits>
 __global__ void attn_split_dv_kernel(
     const IOFloat* __restrict__ Q,                  // (T, H, D)
     const IOFloat* __restrict__ K_cache,            // (B, page_size, H_kv, D)
@@ -321,15 +321,15 @@ __global__ void attn_split_dv_kernel(
     for (int d = tid; d < head_dim; d += nthreads) {
       const float qd = static_cast<float>(q_smem[d]);
       const float kd = static_cast<float>(k_row[d]);
-      qk_fxp += float_to_fixed<FxpInt>(qd * kd);
+      qk_fxp += float_to_fixed<FxpInt, kFracBits>(qd * kd);
     }
     qk_fxp = block_reduce_sum<FxpInt>(qk_fxp, shm_int);
 
-    const float qk = post_process_qk<FxpInt>(
+    const float qk = post_process_qk<FxpInt, kFracBits>(
         qk_fxp, softmax_scale_log2, logit_softcap,
         alibi_slope, kp, q_abs_pos);
     const float weight = exp2f(qk - global_max);
-    const FxpInt weight_fxp = float_to_fixed<FxpInt>(weight);
+    const FxpInt weight_fxp = float_to_fixed<FxpInt, kFracBits>(weight);
 
     if (tid == 0) denom_partial += weight_fxp;
 
@@ -337,7 +337,7 @@ __global__ void attn_split_dv_kernel(
     for (int d = tid; d < head_dim; d += nthreads) {
       const float vd = static_cast<float>(v_row[d]);
       const float prod = weight * vd;
-      out_acc[local_idx] += float_to_fixed<FxpInt>(prod);
+      out_acc[local_idx] += float_to_fixed<FxpInt, kFracBits>(prod);
       ++local_idx;
     }
   }
@@ -359,7 +359,7 @@ __global__ void attn_split_dv_kernel(
   }
 }
 
-template <typename FxpInt, typename IOFloat>
+template <typename FxpInt, typename IOFloat, int kFracBits>
 __global__ void attn_combine_kernel(
     const FxpInt* __restrict__ partial_denom,    // (T, H, S)
     const FxpInt* __restrict__ partial_wv,       // (T, H, S, D)
@@ -397,7 +397,7 @@ __global__ void attn_combine_kernel(
     for (int s = 0; s < num_splits; ++s) {
       acc += pdenom_row[s * stride_pdenom_split];
     }
-    const float d = fixed_to_float<FxpInt>(acc);
+    const float d = fixed_to_float<FxpInt, kFracBits>(acc);
     s_denom = fmaxf(d, 1.0e-6f);
   }
   __syncthreads();
@@ -412,12 +412,12 @@ __global__ void attn_combine_kernel(
     for (int s = 0; s < num_splits; ++s) {
       acc += pwv_row[s * stride_pwv_split + d * stride_pwv_d];
     }
-    const float num = fixed_to_float<FxpInt>(acc);
+    const float num = fixed_to_float<FxpInt, kFracBits>(acc);
     o_row[d] = static_cast<IOFloat>(num / denom);
   }
 }
 
-template <typename FxpInt, typename IOFloat>
+template <typename FxpInt, typename IOFloat, int kFracBits>
 void launch_attention_typed(
     const at::Tensor& q,
     const at::Tensor& k_cache,
@@ -493,7 +493,7 @@ void launch_attention_typed(
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  attn_split_max_kernel<FxpInt, IOFloat><<<grid_split, threads, dyn_smem_bytes, stream>>>(
+  attn_split_max_kernel<FxpInt, IOFloat, kFracBits><<<grid_split, threads, dyn_smem_bytes, stream>>>(
       q.data_ptr<IOFloat>(),
       k_cache.data_ptr<IOFloat>(),
       partial_max.data_ptr<float>(),
@@ -512,7 +512,7 @@ void launch_attention_typed(
       is_causal);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  attn_split_dv_kernel<FxpInt, IOFloat><<<grid_split, threads, dyn_smem_bytes, stream>>>(
+  attn_split_dv_kernel<FxpInt, IOFloat, kFracBits><<<grid_split, threads, dyn_smem_bytes, stream>>>(
       q.data_ptr<IOFloat>(),
       k_cache.data_ptr<IOFloat>(),
       v_cache.data_ptr<IOFloat>(),
@@ -541,7 +541,7 @@ void launch_attention_typed(
   while (combine_threads < head_dim && combine_threads < kMaxThreads) combine_threads <<= 1;
   if (combine_threads > kMaxThreads) combine_threads = kMaxThreads;
 
-  attn_combine_kernel<FxpInt, IOFloat><<<grid_combine, combine_threads, 0, stream>>>(
+  attn_combine_kernel<FxpInt, IOFloat, kFracBits><<<grid_combine, combine_threads, 0, stream>>>(
       partial_denom.template data_ptr<FxpInt>(),
       partial_wv.template data_ptr<FxpInt>(),
       o.data_ptr<IOFloat>(),
@@ -553,7 +553,7 @@ void launch_attention_typed(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <typename FxpInt>
+template <typename FxpInt, int kFracBits>
 void launch_attention(
     const at::Tensor& q,
     const at::Tensor& k_cache,
@@ -576,21 +576,21 @@ void launch_attention(
     int num_splits) {
   switch (q.scalar_type()) {
     case at::kFloat:
-      launch_attention_typed<FxpInt, float>(
+      launch_attention_typed<FxpInt, float, kFracBits>(
           q, k_cache, v_cache, o, query_start_loc, seq_lens, block_table,
           alibi_slopes, num_heads, num_kv_heads, head_dim, page_size,
           softmax_scale_log2, logit_softcap, window_size, is_causal,
           max_query_len, num_requests, num_splits);
       break;
     case at::kHalf:
-      launch_attention_typed<FxpInt, at::Half>(
+      launch_attention_typed<FxpInt, at::Half, kFracBits>(
           q, k_cache, v_cache, o, query_start_loc, seq_lens, block_table,
           alibi_slopes, num_heads, num_kv_heads, head_dim, page_size,
           softmax_scale_log2, logit_softcap, window_size, is_causal,
           max_query_len, num_requests, num_splits);
       break;
     case at::kBFloat16:
-      launch_attention_typed<FxpInt, at::BFloat16>(
+      launch_attention_typed<FxpInt, at::BFloat16, kFracBits>(
           q, k_cache, v_cache, o, query_start_loc, seq_lens, block_table,
           alibi_slopes, num_heads, num_kv_heads, head_dim, page_size,
           softmax_scale_log2, logit_softcap, window_size, is_causal,
@@ -599,6 +599,45 @@ void launch_attention(
     default:
       TORCH_CHECK(false, "unified_attention_fxp: unsupported q dtype ",
                   q.scalar_type());
+  }
+}
+
+template <int kFracBits>
+void attention_dispatch_int(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    at::Tensor& o,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& seq_lens,
+    const at::Tensor& block_table,
+    const at::Tensor* alibi_ptr,
+    int num_heads, int num_kv_heads, int head_dim, int page_size,
+    float ss_log2, float logit_softcap_f, int window_size_i, bool is_causal,
+    int max_query_len_i, int num_requests, int num_kv_splits_i,
+    int64_t fxp_int_bits) {
+  switch (fxp_int_bits) {
+    case 16:
+      launch_attention<int16_t, kFracBits>(
+          q, k_cache, v_cache, o, query_start_loc, seq_lens, block_table,
+          alibi_ptr, num_heads, num_kv_heads, head_dim, page_size, ss_log2,
+          logit_softcap_f, window_size_i, is_causal, max_query_len_i,
+          num_requests, num_kv_splits_i);
+      break;
+    case 32:
+      launch_attention<int32_t, kFracBits>(
+          q, k_cache, v_cache, o, query_start_loc, seq_lens, block_table,
+          alibi_ptr, num_heads, num_kv_heads, head_dim, page_size, ss_log2,
+          logit_softcap_f, window_size_i, is_causal, max_query_len_i,
+          num_requests, num_kv_splits_i);
+      break;
+    case 64:
+      launch_attention<int64_t, kFracBits>(
+          q, k_cache, v_cache, o, query_start_loc, seq_lens, block_table,
+          alibi_ptr, num_heads, num_kv_heads, head_dim, page_size, ss_log2,
+          logit_softcap_f, window_size_i, is_causal, max_query_len_i,
+          num_requests, num_kv_splits_i);
+      break;
   }
 }
 
@@ -616,6 +655,7 @@ void unified_attention_fxp_run(
     bool is_causal,
     c10::optional<double> softmax_scale,
     int64_t fxp_int_bits,
+    int64_t fxp_frac_bits,
     double logit_softcap,
     int64_t window_size,
     int64_t num_kv_splits) {
@@ -646,45 +686,35 @@ void unified_attention_fxp_run(
     alibi_ptr = &alibi_holder;
   }
 
-  switch (fxp_int_bits) {
-    case 16:
-      launch_attention<int16_t>(q, k_cache, v_cache, o,
-                                query_start_loc, seq_lens, block_table,
-                                alibi_ptr,
+  const float logit_softcap_f = static_cast<float>(logit_softcap);
+  const int window_size_i = static_cast<int>(window_size);
+  const int max_query_len_i = static_cast<int>(max_query_len);
+  const int num_kv_splits_i = static_cast<int>(num_kv_splits);
+
+  switch (fxp_frac_bits) {
+    case 8:
+      attention_dispatch_int<8>(q, k_cache, v_cache, o, query_start_loc,
+                                seq_lens, block_table, alibi_ptr,
                                 num_heads, num_kv_heads, head_dim, page_size,
-                                ss_log2,
-                                static_cast<float>(logit_softcap),
-                                static_cast<int>(window_size),
-                                is_causal,
-                                static_cast<int>(max_query_len),
-                                num_requests,
-                                static_cast<int>(num_kv_splits));
+                                ss_log2, logit_softcap_f, window_size_i,
+                                is_causal, max_query_len_i, num_requests,
+                                num_kv_splits_i, fxp_int_bits);
+      break;
+    case 16:
+      attention_dispatch_int<16>(q, k_cache, v_cache, o, query_start_loc,
+                                 seq_lens, block_table, alibi_ptr,
+                                 num_heads, num_kv_heads, head_dim, page_size,
+                                 ss_log2, logit_softcap_f, window_size_i,
+                                 is_causal, max_query_len_i, num_requests,
+                                 num_kv_splits_i, fxp_int_bits);
       break;
     case 32:
-      launch_attention<int32_t>(q, k_cache, v_cache, o,
-                                query_start_loc, seq_lens, block_table,
-                                alibi_ptr,
-                                num_heads, num_kv_heads, head_dim, page_size,
-                                ss_log2,
-                                static_cast<float>(logit_softcap),
-                                static_cast<int>(window_size),
-                                is_causal,
-                                static_cast<int>(max_query_len),
-                                num_requests,
-                                static_cast<int>(num_kv_splits));
-      break;
-    case 64:
-      launch_attention<int64_t>(q, k_cache, v_cache, o,
-                                query_start_loc, seq_lens, block_table,
-                                alibi_ptr,
-                                num_heads, num_kv_heads, head_dim, page_size,
-                                ss_log2,
-                                static_cast<float>(logit_softcap),
-                                static_cast<int>(window_size),
-                                is_causal,
-                                static_cast<int>(max_query_len),
-                                num_requests,
-                                static_cast<int>(num_kv_splits));
+      attention_dispatch_int<32>(q, k_cache, v_cache, o, query_start_loc,
+                                 seq_lens, block_table, alibi_ptr,
+                                 num_heads, num_kv_heads, head_dim, page_size,
+                                 ss_log2, logit_softcap_f, window_size_i,
+                                 is_causal, max_query_len_i, num_requests,
+                                 num_kv_splits_i, fxp_int_bits);
       break;
   }
 }

@@ -54,7 +54,7 @@ def _bench_one(shape: dict, dtype: torch.dtype) -> dict:
     a = torch.randn(M, K, device="cuda", dtype=dtype)
     b = torch.randn(K, N, device="cuda", dtype=dtype)
 
-    fxpr = lambda: torch.ops.fxpr.gemm_fxp(a, b, None, 32)
+    fxpr = lambda: torch.ops.fxpr.gemm_fxp(a, b, None, 32, 16)
     torch_mm = lambda: torch.matmul(a, b)
 
     fxpr_ms = _time(fxpr)

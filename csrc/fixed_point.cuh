@@ -12,21 +12,24 @@
 
 namespace fxpr {
 
-// Override at build time with -DFXPR_FRAC_BITS=N.
-constexpr int kFracBits = FXPR_FRAC_BITS;
-static_assert(kFracBits >= 0 && kFracBits < 127,
-              "FXPR_FRAC_BITS must be in [0, 127)");
+// Default fractional bits used when a caller doesn't specialize. Override at
+// build time with -DFXPR_FRAC_BITS=N. Per-call selection is done via the
+// non-type template argument on the conversion helpers below.
+constexpr int kDefaultFracBits = FXPR_FRAC_BITS;
 
+template <int N>
 __device__ __forceinline__ constexpr float pow2_fp32() {
-  return static_cast<float>(1ULL << kFracBits);
+  static_assert(N >= 0 && N < 64,
+                "frac_bits must satisfy 0 <= N < 64 (must fit a 64-bit shift)");
+  return static_cast<float>(1ULL << N);
 }
 
-template <typename FxpInt>
+template <typename FxpInt, int kFracBits = kDefaultFracBits>
 __device__ __forceinline__ FxpInt float_to_fixed(float x) {
   static_assert(std::is_integral<FxpInt>::value && std::is_signed<FxpInt>::value,
                 "fxp output must be a signed integer type");
 
-  constexpr float scale = pow2_fp32();
+  constexpr float scale = pow2_fp32<kFracBits>();
   const float scaled = x * scale;
   const float rounded = rintf(scaled);
 
@@ -38,16 +41,16 @@ __device__ __forceinline__ FxpInt float_to_fixed(float x) {
   return static_cast<FxpInt>(clamped);
 }
 
-template <typename FxpInt>
+template <typename FxpInt, int kFracBits = kDefaultFracBits>
 __device__ __forceinline__ FxpInt half_to_fixed(__half x) {
-  return float_to_fixed<FxpInt>(__half2float(x));
+  return float_to_fixed<FxpInt, kFracBits>(__half2float(x));
 }
 
-template <typename FxpInt>
+template <typename FxpInt, int kFracBits = kDefaultFracBits>
 __device__ __forceinline__ float fixed_to_float(FxpInt x) {
   static_assert(std::is_integral<FxpInt>::value && std::is_signed<FxpInt>::value,
                 "fxp input must be a signed integer type");
-  constexpr float inv_scale = 1.0f / pow2_fp32();
+  constexpr float inv_scale = 1.0f / pow2_fp32<kFracBits>();
   return static_cast<float>(x) * inv_scale;
 }
 

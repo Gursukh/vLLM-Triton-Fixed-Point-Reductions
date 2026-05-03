@@ -17,6 +17,7 @@ PAGE_SIZE = 16
 
 _INT_BYTES = {16: 2, 32: 4, 64: 8}
 _INT_DTYPE = {16: torch.int16, 32: torch.int32, 64: torch.int64}
+_FRAC_BITS = 16
 
 
 def _build_cast_f2i(shape, cfg):
@@ -25,7 +26,7 @@ def _build_cast_f2i(shape, cfg):
     x = torch.randn(n, device="cuda", dtype=torch.float32)
 
     def fn():
-        return torch.ops.fxpr.float_to_fixed(x, ib)
+        return torch.ops.fxpr.float_to_fixed(x, ib, _FRAC_BITS)
 
     return fn, n, n * (4 + _INT_BYTES[ib])
 
@@ -38,7 +39,7 @@ def _build_cast_i2f(shape, cfg):
                       device="cuda", dtype=_INT_DTYPE[ib])
 
     def fn():
-        return torch.ops.fxpr.fixed_to_float(x, 32)
+        return torch.ops.fxpr.fixed_to_float(x, 32, _FRAC_BITS)
 
     return fn, n, n * (_INT_BYTES[ib] + 4)
 
@@ -50,7 +51,7 @@ def _build_rms_norm(shape, cfg):
     w = torch.randn(Hd, device="cuda", dtype=torch.float32)
 
     def fn():
-        return torch.ops.fxpr.rms_norm_fxp(x, w, 1e-5, ib)
+        return torch.ops.fxpr.rms_norm_fxp(x, w, 1e-5, ib, _FRAC_BITS)
 
     return fn, 4 * N * Hd, 2 * N * Hd * 4 + Hd * 4
 
@@ -66,7 +67,7 @@ def _build_rms_norm_residual(shape, cfg):
     # res is mutated in place; reset every call.
     def fn():
         res.copy_(res_init)
-        return torch.ops.fxpr.rms_norm_fxp_residual(x, res, w, 1e-5, ib)
+        return torch.ops.fxpr.rms_norm_fxp_residual(x, res, w, 1e-5, ib, _FRAC_BITS)
 
     return fn, 5 * N * Hd, 3 * N * Hd * 4 + Hd * 4
 
@@ -77,7 +78,7 @@ def _build_log_softmax(shape, cfg):
     x = torch.randn(N, V, device="cuda", dtype=torch.float32)
 
     def fn():
-        return torch.ops.fxpr.log_softmax_fxp(x, ib)
+        return torch.ops.fxpr.log_softmax_fxp(x, ib, _FRAC_BITS)
 
     return fn, 5 * N * V, 2 * N * V * 4
 
@@ -90,7 +91,7 @@ def _build_gemm(shape, cfg):
     bias = torch.randn(N, device="cuda", dtype=torch.float32)
 
     def fn():
-        return torch.ops.fxpr.gemm_fxp(a, b, bias, ib)
+        return torch.ops.fxpr.gemm_fxp(a, b, bias, ib, _FRAC_BITS)
 
     return fn, 2 * M * N * K, (M * K + K * N + M * N + N) * 4
 
@@ -123,7 +124,7 @@ def _build_attn(shape, cfg):
         torch.ops.fxpr.unified_attention_fxp(
             q, kv_cache, o, qsl, sl, bt, q_t,
             None, is_causal, None,
-            ib, 0.0, 0, num_kv_splits,
+            ib, _FRAC_BITS, 0.0, 0, num_kv_splits,
         )
         return o
 

@@ -1,56 +1,76 @@
-# Fixed-Point Reductions (FxPR) for vLLM
+# Fixed-Point Reductions for vLLM
 
-FxPR for vLLM allows for deterministic inference by removing the non-determinism introduced by floating-point non-associativity. Every reduction is performed as an integer sum on values that have been cast to a signed fixed-point representation up-front. Integer addition is associative, so the result is bitwise-identical regardless of how the work is split across SMs, warps, or KV-cache splits.
+Drop-in plugin that makes vLLM's reductions bitwise reproducible. The trick is
+boring: cast to a signed fixed-point integer up front, do the reduction in
+integer space, cast back. Integer addition is associative, so it doesn't matter
+how the work gets sliced across SMs, warps, or KV splits — you get the same
+bits every time.
 
-The kernels are written in CUDA C++ (no Triton, no CUTLASS, no cuBLAS). Every reduction - RMSNorm, log-softmax, fp32 GEMM, and unified prefill+decode attention - lives in [csrc/](csrc/) and is exposed to Python via `torch.ops.fxpr.*`.
+All the kernels are hand-written CUDA in [csrc/](csrc/). No Triton, no
+CUTLASS, no cuBLAS — the whole point is to control every reduction tree.
+Surfaced to Python through `torch.ops.fxpr.*`.
 
-## How it works
+## What you get
 
-Every reduction follows the same pattern:
+| Op                              | File              |
+| ------------------------------- | ----------------- |
+| `float_to_fixed`/`fixed_to_float` casts | `csrc/casts.cu` |
+| RMSNorm (with fused residual)   | `csrc/rms_norm.cu` |
+| log-softmax                     | `csrc/softmax.cu` |
+| fp32/fp16/bf16 GEMM (tensor cores) | `csrc/gemm.cu` |
+| Unified prefill + decode attention, paged KV | `csrc/attention.cu` |
 
-1. Cast each float operand to a signed fixed-point integer via `float_to_fixed(x, frac_bits, int_dtype)` - round-to-nearest-even with saturation.
-2. Do the reduction as an integer sum.
-3. Cast the integer accumulator back to float via `fixed_to_float`.
+## Install
 
-Because the intermediate accumulator is an integer with a fixed scale, reordering the additions cannot change the result.
+### Wheels
 
-## Installation
-
-### Prebuilt wheels (recommended)
-
-Each tagged release ships binary wheels for the most common (Python, torch, CUDA) combinations on the [Releases page](https://github.com/Gursukh/Fixed-Point-Reductions-For-vLLM/releases). Pick the wheel matching your environment - the filename encodes Python ABI, torch version, and CUDA version, e.g.
+Tagged releases ship wheels for the common (Python, torch, CUDA) combinations
+on the [Releases page](https://github.com/Gursukh/Fixed-Point-Reductions-For-vLLM/releases).
+Filenames encode the ABI:
 
 ```
 fxpr_vllm-0.1.0-cp312-cp312-linux_x86_64+torch2.6.0cu124.whl
-   |        |    |              |             |        |
-   version  py3.12 ABI          platform      torch    CUDA
 ```
 
-For Colab (Python 3.12, torch 2.6+, CUDA 12.4):
+Wheels cover `sm_75` through `sm_90` (Turing → Hopper). Colab example
+(py3.12 / torch 2.6 / CUDA 12.4):
 
-```python
-!pip install https://github.com/Gursukh/Fixed-Point-Reductions-For-vLLM/releases/download/<TAG>/fxpr_vllm-0.1.0-cp312-cp312-linux_x86_64+torch2.6.0cu124.whl
+```bash
+pip install https://github.com/Gursukh/Fixed-Point-Reductions-For-vLLM/releases/download/<TAG>/fxpr_vllm-0.1.0-cp312-cp312-linux_x86_64+torch2.6.0cu124.whl
 ```
 
-The wheel covers `sm_75 → sm_90` (Turing through Hopper); no compilation needed at install time.
+### From source
 
-### Build from source
+If nothing matches your env, build it. Your nvcc has to match the CUDA your
+torch was built against — check with:
 
-If no prebuilt wheel matches your env, compile locally. nvcc must match the CUDA toolkit your local `torch` was built against (run `python -c "import torch; print(torch.version.cuda)"` and install a matching toolkit if necessary).
+```bash
+python -c "import torch; print(torch.version.cuda)"
+```
+
+Then:
 
 ```bash
 pip install --no-build-isolation git+https://github.com/Gursukh/Fixed-Point-Reductions-For-vLLM.git
 ```
 
-`--no-build-isolation` is required: torch C++ extensions need to compile against the same torch ABI that the runtime will load, and pip's default isolated build venv pulls a fresh, possibly mismatched torch.
+`--no-build-isolation` is not optional: pip's isolated build venv would pull a
+fresh torch with a different ABI from the one you'll load at runtime, and the
+extension would fail to import.
 
-To narrow the build (single-arch is much faster), set `TORCH_CUDA_ARCH_LIST` before installing - e.g. `TORCH_CUDA_ARCH_LIST=8.9` for an L4. `MAX_JOBS=4` enables parallel compilation.
+Builds are slow because every kernel is instantiated 3 × 3 ways (frac_bits ×
+int_bits). Narrow the arch list and parallelise:
+
+```bash
+TORCH_CUDA_ARCH_LIST=8.9 MAX_JOBS=8 pip install --no-build-isolation .
+```
 
 ## Usage
 
 ```python
 from vllm import LLM
 from fxpr_vllm.register import register
+
 register()
 
 llm = LLM(
@@ -60,34 +80,50 @@ llm = LLM(
 )
 ```
 
-### Runtime configuration
+### Knobs
 
-See [config.py](fxpr_vllm/config.py).
+All configured via environment variables at process start (see
+[`config.py`](fxpr_vllm/config.py)).
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `VLLM_FXP_FRAC_BITS` | `16` | Number of fractional bits in the Q-format (higher = finer resolution, smaller dynamic range). |
-| `VLLM_FXP_INT_BITS` | `32` | Accumulator width. One of `16`, `32`, `64`. |
-| `VLLM_FXP_NUM_KV_SPLITS` | `8` | Number of KV splits for the decode attention kernel. |
+| Var                       | Default | Allowed       | What it does |
+| ------------------------- | ------- | ------------- | ------------ |
+| `VLLM_FXP_FRAC_BITS`      | `16`    | `8`/`16`/`32` | Fractional bits in the Q-format. More = finer resolution, less dynamic range. |
+| `VLLM_FXP_INT_BITS`       | `32`    | `16`/`32`/`64`| Integer accumulator width. |
+| `VLLM_FXP_NUM_KV_SPLITS`  | `8`     | `>= 1`        | KV splits for the decode attention kernel. |
 
-## Architecture
+The `frac_bits` × `int_bits` pair is what fixes the dynamic range. Q16.16 in a
+32-bit accumulator gets you about ±32K in original units before saturation;
+bump int_bits to 64 if your activations cluster wider.
+
+## Layout
 
 ```
 csrc/
-  bindings.cpp          # TORCH_LIBRARY registrations (op surface)
-  fixed_point.cuh       # device float<->fixed helpers
-  casts.cu              # float_to_fixed / fixed_to_float ops
-  rms_norm.cu           # RMSNorm (+ fused residual)
-  softmax.cu            # log-softmax
-  gemm.cu               # scalar fp32 GEMM
-  attention.cu          # unified prefill+decode, paged KV
+  bindings.cpp        TORCH_LIBRARY registrations (Python-facing schemas)
+  ops.cpp             argument validation
+  ops_internal.h      detail::*_run signatures
+  fixed_point.cuh     templated device-side float <-> fixed helpers
+  casts.cu            float_to_fixed / fixed_to_float
+  rms_norm.cu         RMSNorm + residual variant
+  softmax.cu          log-softmax
+  gemm.cu             tensor-core GEMM with fxp inter-tile accumulation
+  attention.cu        unified prefill + decode, paged KV, split-K
 fxpr_vllm/
-  _cuda                 # built CUDA extension (.so)
-  library_ops.py        # Python re-export shim over torch.ops.fxpr.*
-  register.py           # vLLM plugin entry point
-  monkey_patches.py     # patches for parts vLLM doesn't expose
+  _cuda               built extension (.so)
+  library_ops.py      Python wrappers + meta/fake impls for Dynamo
+  register.py         vLLM plugin entry point
+  monkey_patches.py   the bits vLLM doesn't expose cleanly
   quantisation_config.py
   attention_backend.py
   rms_norm.py
   sampling.py
 ```
+
+## Tests
+
+```bash
+pytest tests/
+```
+
+Needs CUDA. GEMM tests for bf16/fp32 require sm_80+ (Ampere or newer); they
+skip otherwise.

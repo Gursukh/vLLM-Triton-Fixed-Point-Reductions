@@ -15,15 +15,25 @@ _FLOAT_BITS_BY_DTYPE = {
     torch.float64: 64,
 }
 
+DEFAULT_FXP_FRAC_BITS = 16
 
-def float_to_fixed(x: torch.Tensor, out: torch.dtype) -> torch.Tensor:
+
+def float_to_fixed(
+    x: torch.Tensor,
+    out: torch.dtype,
+    fxp_frac_bits: int = DEFAULT_FXP_FRAC_BITS,
+) -> torch.Tensor:
     int_bits = _INT_BITS_BY_DTYPE[out]
-    return torch.ops.fxpr.float_to_fixed(x.contiguous(), int_bits)
+    return torch.ops.fxpr.float_to_fixed(x.contiguous(), int_bits, int(fxp_frac_bits))
 
 
-def fixed_to_float(x: torch.Tensor, out: torch.dtype) -> torch.Tensor:
+def fixed_to_float(
+    x: torch.Tensor,
+    out: torch.dtype,
+    fxp_frac_bits: int = DEFAULT_FXP_FRAC_BITS,
+) -> torch.Tensor:
     float_bits = _FLOAT_BITS_BY_DTYPE[out]
-    return torch.ops.fxpr.fixed_to_float(x.contiguous(), float_bits)
+    return torch.ops.fxpr.fixed_to_float(x.contiguous(), float_bits, int(fxp_frac_bits))
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -53,12 +63,14 @@ def gemm_fxp_test(
     b: torch.Tensor,
     bias: torch.Tensor | None = None,
     fxp_int_bits: int = 32,
+    fxp_frac_bits: int = DEFAULT_FXP_FRAC_BITS,
 ) -> torch.Tensor:
     return torch.ops.fxpr.gemm_fxp(
         a.contiguous(),
         b.contiguous(),
         bias if bias is None else bias.contiguous(),
         int(fxp_int_bits),
+        int(fxp_frac_bits),
     )
 
 
@@ -78,6 +90,8 @@ def prefill_fxp_test(
     is_causal: bool = True,
     softmax_scale: float | None = None,
     num_kv_splits: int = 8,
+    fxp_int_bits: int = 32,
+    fxp_frac_bits: int = DEFAULT_FXP_FRAC_BITS,
 ) -> None:
     # page_size=1 KV cache so each token gets its own block.
     if alibi_slopes is not None:
@@ -123,7 +137,8 @@ def prefill_fxp_test(
         alibi_slopes,
         bool(is_causal),
         None if softmax_scale is None else float(softmax_scale),
-        32,
+        int(fxp_int_bits),
+        int(fxp_frac_bits),
         0.0,
         0,
         int(num_kv_splits),
