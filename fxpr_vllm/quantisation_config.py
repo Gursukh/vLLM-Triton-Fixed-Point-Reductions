@@ -7,6 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -16,23 +17,18 @@ from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.layers.quantization import register_quantization_config
 
 from .library_ops import gemm_fxp
-from .config import DEFAULT_FRAC_BITS, get_runtime_config
+from .config import get_runtime_config
 
 logger = logging.getLogger("fxpr_vllm")
 
 
 @register_quantization_config("fixed_point_det")
 class FixedPointConfig(QuantizationConfig):
-    def __init__(self, frac_bits: int = DEFAULT_FRAC_BITS) -> None:
-        int_bits = get_runtime_config().fxp_int_bits
-        if not isinstance(frac_bits, int) or not (0 <= frac_bits < int_bits):
-            raise ValueError(
-                f"frac_bits must be an int in [0, {int_bits}); got {frac_bits!r}"
-            )
-        self.frac_bits = frac_bits
+    def __init__(self) -> None:
+        pass
 
     def __repr__(self) -> str:
-        return f"FixedPointConfig(frac_bits={self.frac_bits})"
+        return "FixedPointConfig()"
 
     @classmethod
     def get_name(cls) -> str:
@@ -52,8 +48,7 @@ class FixedPointConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "FixedPointConfig":
-        frac_bits = config.get("frac_bits", get_runtime_config().frac_bits)
-        return cls(frac_bits=frac_bits)
+        return cls()
 
     def get_quant_method(
         self,
@@ -83,27 +78,28 @@ class FixedPointLinearMethod(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs: Any,
     ) -> None:
-        total_output_size = sum(output_partition_sizes)
 
+        weight_loader = extra_weight_attrs.pop("weight_loader")
         weight = ModelWeightParameter(
             data=torch.empty(
-                total_output_size,
+                sum(output_partition_sizes),
                 input_size_per_partition,
                 dtype=params_dtype,
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=extra_weight_attrs.get("weight_loader"),
+            weight_loader=weight_loader,
         )
+
         layer.register_parameter("weight", weight)
+        set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        # Stored (out, in); GEMM expects (K, N) = (in, out). Cache as fp32.
+        # Stored as (out, in); GEMM wants (K, N) = (in, out).
         with torch.no_grad():
-            w = layer.weight.data.to(torch.float32)
-            w_t = w.t().contiguous()
+            w_t = layer.weight.data.t().contiguous()
 
-        layer.weight_fp32 = w_t
+        layer.weight_native = w_t
         del layer.weight
         layer.register_parameter("weight", None)
 
@@ -113,23 +109,4 @@ class FixedPointLinearMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        orig_dtype = x.dtype
-
-        x2d = x.reshape(-1, x.shape[-1])
-        if x2d.dtype != torch.float32:
-            x2d = x2d.to(torch.float32)
-        if not x2d.is_contiguous():
-            x2d = x2d.contiguous()
-
-        out = gemm_fxp(
-            x2d,
-            layer.weight_fp32,
-            self.config.frac_bits,
-            self.fxp_int_bits,
-        )
-        out = out.view(*x.shape[:-1], out.shape[-1])
-
-        if bias is not None:
-            out = out + bias.to(torch.float32)
-
-        return out.to(orig_dtype)
+        return gemm_fxp(x, layer.weight_native, bias, self.fxp_int_bits)

@@ -1,14 +1,6 @@
-// Unified prefill + decode attention with paged KV, split-K pipeline.
-// Three kernels run in sequence (per-kernel docs at each definition):
-//   1. attn_split_max_kernel  per-(token, head, split) row_max.
-//   2. attn_split_dv_kernel   per-split denom + weighted-V partials.
-//   3. attn_combine_kernel    sum partials across splits, divide, write O.
-//
-// Determinism: every reduction is either integer (qk dot, denom, wV) or
-// fmaxf (row_max), both order-invariant. softmax_scale is pre-multiplied
-// by RCP_LN2 so qk lives in log2 domain and matches exp2(). Chunk
-// boundaries are pure functions of (key_start, key_end, num_splits,
-// split_index), independent of scheduling.
+// Unified prefill + decode attention, paged KV, split-K.
+// All reductions are integer (qk dot, denom, wV) or fmaxf (row_max).
+// softmax_scale is pre-scaled by 1/ln(2) so qk lives in log2 space.
 
 #include "fixed_point.cuh"
 #include "ops_internal.h"
@@ -19,7 +11,9 @@
 #include <c10/cuda/CUDAException.h>
 
 #include <cuda_fp16.h>
+#include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace fxpr {
 namespace detail {
@@ -41,6 +35,11 @@ __device__ __forceinline__ T warp_reduce_sum(T v) {
 
 template <typename FxpInt>
 __device__ FxpInt block_reduce_sum(FxpInt v, FxpInt* shmem) {
+  // Single-warp fast path skips the smem stage and two __syncthreads.
+  if (blockDim.x <= kWarpSize) {
+    return warp_reduce_sum<FxpInt>(v);
+  }
+
   const int tid = threadIdx.x;
   const int lane = tid & (kWarpSize - 1);
   const int warp = tid / kWarpSize;
@@ -59,8 +58,6 @@ __device__ FxpInt block_reduce_sum(FxpInt v, FxpInt* shmem) {
   return shmem[0];
 }
 
-// Resolve a logical key position to a pointer to its head-dim row in
-// kv_cache (num_blocks, 2, block_size, num_kv_heads, head_dim).
 template <typename T>
 __device__ __forceinline__ const T* paged_kv_row(
     const T* kv_base,
@@ -80,27 +77,25 @@ __device__ __forceinline__ const T* paged_kv_row(
       + kv_head * stride_head;
 }
 
-// Deterministic split of [key_start, key_end) into num_splits contiguous
-// chunks. Some chunks may be empty when key_end - key_start < num_splits.
+// Slice [key_start, key_end) into num_splits chunks (some may be empty).
 __device__ __forceinline__ void compute_chunk(
     int key_start, int key_end, int num_splits, int split_index,
     int* chunk_start_out, int* chunk_end_out) {
   const int total = key_end - key_start;
-  // 64-bit math: total*split_index can overflow int on long contexts.
+  // 64-bit to avoid overflow on long contexts.
   const int64_t s_lo = (int64_t)split_index * total;
   const int64_t s_hi = (int64_t)(split_index + 1) * total;
   *chunk_start_out = key_start + (int)(s_lo / num_splits);
   *chunk_end_out   = key_start + (int)(s_hi / num_splits);
 }
 
-// Per-key post-processing shared by kernel 1 and 2 so they compute the
-// same qk_post for the same key.
+// Shared between both passes so qk_post matches per key.
 template <typename FxpInt>
 __device__ __forceinline__ float post_process_qk(
-    FxpInt qk_fxp, int frac_bits,
+    FxpInt qk_fxp,
     float softmax_scale_log2, float logit_softcap,
     float alibi_slope, int kp, int q_abs_pos) {
-  float qk = fixed_to_float<FxpInt>(qk_fxp, frac_bits);
+  float qk = fixed_to_float<FxpInt>(qk_fxp);
   qk = qk * softmax_scale_log2;
   if (logit_softcap > 0.0f) {
     const float softcap_log2 = logit_softcap * kRcpLn2;
@@ -110,7 +105,6 @@ __device__ __forceinline__ float post_process_qk(
   return qk;
 }
 
-// Kernel 1: per-(token, head, split) row_max via fmaxf reduction over qk_post.
 template <typename FxpInt, typename IOFloat>
 __global__ void attn_split_max_kernel(
     const IOFloat* __restrict__ Q,                  // (T, H, D)
@@ -137,8 +131,7 @@ __global__ void attn_split_max_kernel(
     float softmax_scale_log2,
     float logit_softcap,
     int   window_size,
-    bool  is_causal,
-    int   frac_bits) {
+    bool  is_causal) {
   const int request_index = blockIdx.x;
   const int q_in_request = blockIdx.y;
   const int hs = blockIdx.z;
@@ -165,7 +158,7 @@ __global__ void attn_split_max_kernel(
   const int tid = threadIdx.x;
   const int nthreads = blockDim.x;
 
-  // Empty chunk: host-init -INFINITY is the identity for fmaxf reductions.
+  // partial_max is host-init -INFINITY (fmaxf identity).
   if (chunk_start >= chunk_end) return;
 
   const float alibi_slope =
@@ -194,13 +187,12 @@ __global__ void attn_split_max_kernel(
     for (int d = tid; d < head_dim; d += nthreads) {
       const float qd = static_cast<float>(q_smem[d]);
       const float kd = static_cast<float>(k_row[d]);
-      const float prod = __fmul_rn(qd, kd);
-      partial += float_to_fixed<FxpInt>(prod, frac_bits);
+      partial += float_to_fixed<FxpInt>(qd * kd);
     }
     partial = block_reduce_sum<FxpInt>(partial, shm_int);
 
     const float qk = post_process_qk<FxpInt>(
-        partial, frac_bits, softmax_scale_log2, logit_softcap,
+        partial, softmax_scale_log2, logit_softcap,
         alibi_slope, kp, q_abs_pos);
     row_max = fmaxf(row_max, qk);
   }
@@ -212,8 +204,6 @@ __global__ void attn_split_max_kernel(
   }
 }
 
-// Kernel 2: re-scan the chunk with weight = exp2(qk_post - global_max)
-// and accumulate per-split denom + weighted-V in fxp.
 template <typename FxpInt, typename IOFloat>
 __global__ void attn_split_dv_kernel(
     const IOFloat* __restrict__ Q,                  // (T, H, D)
@@ -253,8 +243,7 @@ __global__ void attn_split_dv_kernel(
     float softmax_scale_log2,
     float logit_softcap,
     int   window_size,
-    bool  is_causal,
-    int   frac_bits) {
+    bool  is_causal) {
   const int request_index = blockIdx.x;
   const int q_in_request = blockIdx.y;
   const int hs = blockIdx.z;
@@ -278,7 +267,7 @@ __global__ void attn_split_dv_kernel(
   int chunk_start, chunk_end;
   compute_chunk(key_start, key_end, num_splits, split_index, &chunk_start, &chunk_end);
 
-  // Empty chunk: host-init 0 is the identity for the fxp sum in combine.
+  // partial_denom / partial_wv are host-init 0.
   if (chunk_start >= chunk_end) return;
 
   const int tid = threadIdx.x;
@@ -299,7 +288,6 @@ __global__ void attn_split_dv_kernel(
   }
   __syncthreads();
 
-  // global_max = fmaxf across S partial_max values; order-invariant.
   __shared__ float s_global_max;
   if (tid == 0) {
     float m = -INFINITY;
@@ -314,7 +302,6 @@ __global__ void attn_split_dv_kernel(
   __syncthreads();
   const float global_max = s_global_max;
 
-  // Per-thread output accumulator: each thread owns a strided slice of head_dim.
   FxpInt out_acc[kMaxPerThread];
   #pragma unroll
   for (int i = 0; i < kMaxPerThread; ++i) out_acc[i] = 0;
@@ -329,30 +316,28 @@ __global__ void attn_split_dv_kernel(
         V_cache, bt_row, kp, page_size, kv_head_index,
         stride_v_block, stride_v_slot, stride_v_head);
 
-    // Recompute qk in fxp; chunks are small enough that round-tripping
-    // through HBM costs more than the recompute.
+    // Cheaper to recompute qk than to stage it through HBM.
     FxpInt qk_fxp = 0;
     for (int d = tid; d < head_dim; d += nthreads) {
       const float qd = static_cast<float>(q_smem[d]);
       const float kd = static_cast<float>(k_row[d]);
-      qk_fxp += float_to_fixed<FxpInt>(__fmul_rn(qd, kd), frac_bits);
+      qk_fxp += float_to_fixed<FxpInt>(qd * kd);
     }
     qk_fxp = block_reduce_sum<FxpInt>(qk_fxp, shm_int);
 
     const float qk = post_process_qk<FxpInt>(
-        qk_fxp, frac_bits, softmax_scale_log2, logit_softcap,
+        qk_fxp, softmax_scale_log2, logit_softcap,
         alibi_slope, kp, q_abs_pos);
     const float weight = exp2f(qk - global_max);
-    const FxpInt weight_fxp = float_to_fixed<FxpInt>(weight, frac_bits);
+    const FxpInt weight_fxp = float_to_fixed<FxpInt>(weight);
 
-    // Every thread sees the same `weight`; tid 0 owns the per-CTA partial.
     if (tid == 0) denom_partial += weight_fxp;
 
     int local_idx = 0;
     for (int d = tid; d < head_dim; d += nthreads) {
       const float vd = static_cast<float>(v_row[d]);
-      const float prod = __fmul_rn(weight, vd);
-      out_acc[local_idx] += float_to_fixed<FxpInt>(prod, frac_bits);
+      const float prod = weight * vd;
+      out_acc[local_idx] += float_to_fixed<FxpInt>(prod);
       ++local_idx;
     }
   }
@@ -374,13 +359,11 @@ __global__ void attn_split_dv_kernel(
   }
 }
 
-// Kernel 3: combine sum partials across S in integer arithmetic,
-// divide in fp32, write O.
-template <typename FxpInt>
+template <typename FxpInt, typename IOFloat>
 __global__ void attn_combine_kernel(
     const FxpInt* __restrict__ partial_denom,    // (T, H, S)
     const FxpInt* __restrict__ partial_wv,       // (T, H, S, D)
-    float*        __restrict__ O,                // (T, H, D)
+    IOFloat*      __restrict__ O,                // (T, H, D)
     const int* __restrict__ query_start_loc,
     int num_heads, int head_dim, int num_splits,
     int64_t stride_pdenom_token,
@@ -391,8 +374,7 @@ __global__ void attn_combine_kernel(
     int64_t stride_pwv_split,
     int64_t stride_pwv_d,
     int64_t stride_o_token,
-    int64_t stride_o_head,
-    int frac_bits) {
+    int64_t stride_o_head) {
   const int request_index = blockIdx.x;
   const int q_in_request = blockIdx.y;
   const int head_index = blockIdx.z;
@@ -406,7 +388,6 @@ __global__ void attn_combine_kernel(
   const int tid = threadIdx.x;
   const int nthreads = blockDim.x;
 
-  // Fixed s = 0..S-1 order; integer add is associative.
   __shared__ float s_denom;
   if (tid == 0) {
     FxpInt acc = 0;
@@ -416,7 +397,7 @@ __global__ void attn_combine_kernel(
     for (int s = 0; s < num_splits; ++s) {
       acc += pdenom_row[s * stride_pdenom_split];
     }
-    const float d = fixed_to_float<FxpInt>(acc, frac_bits);
+    const float d = fixed_to_float<FxpInt>(acc);
     s_denom = fmaxf(d, 1.0e-6f);
   }
   __syncthreads();
@@ -425,14 +406,14 @@ __global__ void attn_combine_kernel(
   const FxpInt* pwv_row = partial_wv
       + q_token_idx * stride_pwv_token
       + head_index * stride_pwv_head;
-  float* o_row = O + q_token_idx * stride_o_token + head_index * stride_o_head;
+  IOFloat* o_row = O + q_token_idx * stride_o_token + head_index * stride_o_head;
   for (int d = tid; d < head_dim; d += nthreads) {
     FxpInt acc = 0;
     for (int s = 0; s < num_splits; ++s) {
       acc += pwv_row[s * stride_pwv_split + d * stride_pwv_d];
     }
-    const float num = fixed_to_float<FxpInt>(acc, frac_bits);
-    o_row[d] = num / denom;
+    const float num = fixed_to_float<FxpInt>(acc);
+    o_row[d] = static_cast<IOFloat>(num / denom);
   }
 }
 
@@ -454,12 +435,14 @@ void launch_attention_typed(
     float logit_softcap,
     int window_size,
     bool is_causal,
-    int frac_bits,
     int max_query_len,
     int num_requests,
     int num_splits) {
   if (num_requests == 0) return;
 
+  // threads = next_pow2(head_dim), capped at kMaxThreads. More warps
+  // hide LDG latency in the per-key inner loop; single-warp was ~2.5x
+  // slower on the A100 profile.
   int threads = 32;
   while (threads < head_dim && threads < kMaxThreads) threads <<= 1;
   if (threads > kMaxThreads) threads = kMaxThreads;
@@ -473,29 +456,39 @@ void launch_attention_typed(
               (head_dim + threads - 1) / threads,
               " exceeds kMaxPerThread=", kMaxPerThread,
               " (head_dim=", head_dim, ", threads=", threads, ")");
-  TORCH_CHECK(num_splits >= 1, "num_splits must be >= 1");
+  TORCH_CHECK(num_splits >= 0, "num_splits must be >= 0");
 
-  // Scratch (T = q.size(0)):
-  //   partial_max:   (T, H, S)            fp32, init -INFINITY
-  //   partial_denom: (T, H, S)            FxpInt, init 0
-  //   partial_wv:    (T, H, S, head_dim)  FxpInt, init 0
+  // Prefill already has enough CTAs to fill the GPU, so force splits=1.
+  // Decode honours num_splits when >= 1; pass 0 to auto-pick.
+  int effective_splits;
+  if (max_query_len > 1) {
+    effective_splits = 1;
+  } else if (num_splits >= 1) {
+    effective_splits = num_splits;
+  } else {
+    const auto& props = *at::cuda::getDeviceProperties(q.device().index());
+    const int num_sms = props.multiProcessorCount;
+    const int total_mblocks = std::max(1, num_requests * num_heads);
+    effective_splits = std::max(1, num_sms / total_mblocks);
+  }
+
   const auto fxp_dtype = c10::CppTypeToScalarType<FxpInt>::value;
   const int64_t T_total = q.size(0);
 
   auto partial_max = at::full(
-      {T_total, num_heads, num_splits},
+      {T_total, num_heads, effective_splits},
       -std::numeric_limits<float>::infinity(),
       q.options().dtype(at::kFloat));
   auto partial_denom = at::zeros(
-      {T_total, num_heads, num_splits},
+      {T_total, num_heads, effective_splits},
       q.options().dtype(fxp_dtype));
   auto partial_wv = at::zeros(
-      {T_total, num_heads, num_splits, head_dim},
+      {T_total, num_heads, effective_splits, head_dim},
       q.options().dtype(fxp_dtype));
 
   const size_t dyn_smem_bytes = head_dim * sizeof(IOFloat);
 
-  dim3 grid_split(num_requests, max_query_len, num_heads * num_splits);
+  dim3 grid_split(num_requests, max_query_len, num_heads * effective_splits);
   dim3 grid_combine(num_requests, max_query_len, num_heads);
 
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -508,7 +501,7 @@ void launch_attention_typed(
       seq_lens.data_ptr<int>(),
       block_table.data_ptr<int>(),
       alibi_slopes ? alibi_slopes->data_ptr<float>() : nullptr,
-      num_heads, num_kv_heads, head_dim, page_size, num_splits,
+      num_heads, num_kv_heads, head_dim, page_size, effective_splits,
       q.stride(0), q.stride(1),
       k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
       partial_max.stride(0), partial_max.stride(1), partial_max.stride(2),
@@ -516,8 +509,7 @@ void launch_attention_typed(
       softmax_scale_log2,
       logit_softcap,
       window_size,
-      is_causal,
-      frac_bits);
+      is_causal);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   attn_split_dv_kernel<FxpInt, IOFloat><<<grid_split, threads, dyn_smem_bytes, stream>>>(
@@ -531,7 +523,7 @@ void launch_attention_typed(
       seq_lens.data_ptr<int>(),
       block_table.data_ptr<int>(),
       alibi_slopes ? alibi_slopes->data_ptr<float>() : nullptr,
-      num_heads, num_kv_heads, head_dim, page_size, num_splits,
+      num_heads, num_kv_heads, head_dim, page_size, effective_splits,
       q.stride(0), q.stride(1),
       k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
       v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
@@ -542,24 +534,22 @@ void launch_attention_typed(
       softmax_scale_log2,
       logit_softcap,
       window_size,
-      is_causal,
-      frac_bits);
+      is_causal);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   int combine_threads = 32;
   while (combine_threads < head_dim && combine_threads < kMaxThreads) combine_threads <<= 1;
   if (combine_threads > kMaxThreads) combine_threads = kMaxThreads;
 
-  attn_combine_kernel<FxpInt><<<grid_combine, combine_threads, 0, stream>>>(
+  attn_combine_kernel<FxpInt, IOFloat><<<grid_combine, combine_threads, 0, stream>>>(
       partial_denom.template data_ptr<FxpInt>(),
       partial_wv.template data_ptr<FxpInt>(),
-      o.data_ptr<float>(),
+      o.data_ptr<IOFloat>(),
       query_start_loc.data_ptr<int>(),
-      num_heads, head_dim, num_splits,
+      num_heads, head_dim, effective_splits,
       partial_denom.stride(0), partial_denom.stride(1), partial_denom.stride(2),
       partial_wv.stride(0), partial_wv.stride(1), partial_wv.stride(2), partial_wv.stride(3),
-      o.stride(0), o.stride(1),
-      frac_bits);
+      o.stride(0), o.stride(1));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -581,7 +571,6 @@ void launch_attention(
     float logit_softcap,
     int window_size,
     bool is_causal,
-    int frac_bits,
     int max_query_len,
     int num_requests,
     int num_splits) {
@@ -591,21 +580,21 @@ void launch_attention(
           q, k_cache, v_cache, o, query_start_loc, seq_lens, block_table,
           alibi_slopes, num_heads, num_kv_heads, head_dim, page_size,
           softmax_scale_log2, logit_softcap, window_size, is_causal,
-          frac_bits, max_query_len, num_requests, num_splits);
+          max_query_len, num_requests, num_splits);
       break;
     case at::kHalf:
       launch_attention_typed<FxpInt, at::Half>(
           q, k_cache, v_cache, o, query_start_loc, seq_lens, block_table,
           alibi_slopes, num_heads, num_kv_heads, head_dim, page_size,
           softmax_scale_log2, logit_softcap, window_size, is_causal,
-          frac_bits, max_query_len, num_requests, num_splits);
+          max_query_len, num_requests, num_splits);
       break;
     case at::kBFloat16:
       launch_attention_typed<FxpInt, at::BFloat16>(
           q, k_cache, v_cache, o, query_start_loc, seq_lens, block_table,
           alibi_slopes, num_heads, num_kv_heads, head_dim, page_size,
           softmax_scale_log2, logit_softcap, window_size, is_causal,
-          frac_bits, max_query_len, num_requests, num_splits);
+          max_query_len, num_requests, num_splits);
       break;
     default:
       TORCH_CHECK(false, "unified_attention_fxp: unsupported q dtype ",
@@ -626,15 +615,13 @@ void unified_attention_fxp_run(
     c10::optional<at::Tensor> alibi_slopes,
     bool is_causal,
     c10::optional<double> softmax_scale,
-    int64_t frac_bits,
     int64_t fxp_int_bits,
     double logit_softcap,
     int64_t window_size,
     int64_t num_kv_splits) {
   const c10::cuda::CUDAGuard device_guard(q.device());
 
-  // Strided K, V views the kernel uses explicit strides; .contiguous()
-  // would double HBM usage of the cache.
+  // Strided views; calling .contiguous() here would double HBM usage.
   auto k_cache = kv_cache.select(1, 0);
   auto v_cache = kv_cache.select(1, 1);
 
@@ -669,7 +656,6 @@ void unified_attention_fxp_run(
                                 static_cast<float>(logit_softcap),
                                 static_cast<int>(window_size),
                                 is_causal,
-                                static_cast<int>(frac_bits),
                                 static_cast<int>(max_query_len),
                                 num_requests,
                                 static_cast<int>(num_kv_splits));
@@ -683,7 +669,6 @@ void unified_attention_fxp_run(
                                 static_cast<float>(logit_softcap),
                                 static_cast<int>(window_size),
                                 is_causal,
-                                static_cast<int>(frac_bits),
                                 static_cast<int>(max_query_len),
                                 num_requests,
                                 static_cast<int>(num_kv_splits));
@@ -697,7 +682,6 @@ void unified_attention_fxp_run(
                                 static_cast<float>(logit_softcap),
                                 static_cast<int>(window_size),
                                 is_causal,
-                                static_cast<int>(frac_bits),
                                 static_cast<int>(max_query_len),
                                 num_requests,
                                 static_cast<int>(num_kv_splits));

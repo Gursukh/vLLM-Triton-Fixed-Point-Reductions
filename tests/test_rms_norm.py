@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-import fxpr_vllm._cuda  # noqa: F401  (registers torch.ops.fxpr.*)
+import fxpr_vllm._cuda  # noqa: F401
 from tests.fixed_point_helpers import requires_cuda
 
 
@@ -12,13 +12,12 @@ def _run_rms_norm_kernel(
     assert x.dtype == torch.float32 and w.dtype == torch.float32
     assert x.ndim == 2 and w.ndim == 1
     assert x.shape[1] == w.shape[0]
-    return torch.ops.fxpr.rms_norm_fxp(x, w, eps, 16, 64)
+    return torch.ops.fxpr.rms_norm_fxp(x, w, eps, 64)
 
 
 def _run_rms_norm_float_kernel(
     x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
-    """Torch-native fp32 RMSNorm reference."""
     assert x.is_cuda and w.is_cuda
     assert x.dtype == torch.float32 and w.dtype == torch.float32
     assert x.ndim == 2 and w.ndim == 1
@@ -43,7 +42,7 @@ def test_rms_norm_fixed_point_correctness(shape):
     batch, hidden = shape
     g = torch.Generator(device="cuda").manual_seed(0)
 
-    # Keep values comfortably away from per-element fixed-point saturation at Q16.16.
+    # Keep below Q16.16 saturation.
     x = (
         torch.rand((batch, hidden), device="cuda", dtype=torch.float32, generator=g)
         - 0.5
@@ -55,18 +54,15 @@ def test_rms_norm_fixed_point_correctness(shape):
     got = _run_rms_norm_kernel(x, w, eps=1e-6)
     ref = _run_rms_norm_float_kernel(x, w, eps=1e-6)
 
-    # Fixed-point sum quantization (Q16.16) should stay close to full-float RMSNorm.
     assert torch.allclose(got, ref, atol=5e-4, rtol=5e-4)
 
 
 @requires_cuda
-@pytest.mark.parametrize("int_bits,frac_bits", [(16, 8), (32, 16), (64, 32)])
-def test_rms_norm_parametrized_int_bits(int_bits, frac_bits):
-    """Exercise _int_dtype_for_bits across all supported (int_bits, frac_bits)."""
+@pytest.mark.parametrize("int_bits", [32, 64])
+def test_rms_norm_parametrized_int_bits(int_bits):
     batch, hidden = 3, 16
     g = torch.Generator(device="cuda").manual_seed(int_bits)
 
-    # Keep values small so per-element squares fit even at int_bits=16, frac_bits=8.
     x = (
         torch.rand((batch, hidden), device="cuda", dtype=torch.float32, generator=g)
         - 0.5
@@ -75,19 +71,90 @@ def test_rms_norm_parametrized_int_bits(int_bits, frac_bits):
         torch.rand((hidden,), device="cuda", dtype=torch.float32, generator=g) - 0.5
     ) * 2.0
 
-    got = torch.ops.fxpr.rms_norm_fxp(x, w, 1e-6, frac_bits, int_bits)
+    got = torch.ops.fxpr.rms_norm_fxp(x, w, 1e-6, int_bits)
     ref = _run_rms_norm_float_kernel(x, w, eps=1e-6)
 
     assert torch.allclose(got, ref, atol=5e-2, rtol=5e-2), (
-        f"max error = {(got - ref).abs().max().item()} "
-        f"at int_bits={int_bits} frac_bits={frac_bits}"
+        f"max error = {(got - ref).abs().max().item()} at int_bits={int_bits}"
+    )
+
+
+_DTYPE_TOL = {
+    torch.float32: (5e-4, 5e-4),
+    torch.float16: (5e-3, 5e-3),
+    torch.bfloat16: (2e-2, 2e-2),
+}
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(2, 16), (4, 64)])
+def test_rms_norm_native_dtype(dtype, shape):
+    batch, hidden = shape
+    g = torch.Generator(device="cuda").manual_seed(0)
+
+    x_f32 = (
+        torch.rand((batch, hidden), device="cuda", dtype=torch.float32, generator=g)
+        - 0.5
+    ) * 4.0
+    w_f32 = (
+        torch.rand((hidden,), device="cuda", dtype=torch.float32, generator=g) - 0.5
+    ) * 2.0
+
+    x = x_f32.to(dtype)
+    w = w_f32.to(dtype)
+
+    got = torch.ops.fxpr.rms_norm_fxp(x, w, 1e-6, 64)
+    assert got.dtype == dtype, f"output dtype {got.dtype} != input dtype {dtype}"
+
+    # Reference is fp32 + cast, matching the kernel's internals.
+    ref_f32 = _run_rms_norm_float_kernel(x.to(torch.float32), w.to(torch.float32), 1e-6)
+    ref = ref_f32.to(dtype)
+
+    atol, rtol = _DTYPE_TOL[dtype]
+    assert torch.allclose(got.to(torch.float32), ref.to(torch.float32),
+                          atol=atol, rtol=rtol), (
+        f"max error = {(got.to(torch.float32) - ref.to(torch.float32)).abs().max().item()} "
+        f"at dtype={dtype}"
     )
 
 
 @requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_rms_norm_residual_native_dtype(dtype):
+    batch, hidden = 4, 32
+    g = torch.Generator(device="cuda").manual_seed(11)
+
+    x_f32 = (
+        torch.rand((batch, hidden), device="cuda", dtype=torch.float32, generator=g)
+        - 0.5
+    ) * 2.0
+    r_f32 = (
+        torch.rand((batch, hidden), device="cuda", dtype=torch.float32, generator=g)
+        - 0.5
+    ) * 2.0
+    w_f32 = (
+        torch.rand((hidden,), device="cuda", dtype=torch.float32, generator=g) - 0.5
+    ) * 2.0
+
+    x = x_f32.to(dtype)
+    r = r_f32.to(dtype)
+    r_orig = r.clone()
+    w = w_f32.to(dtype)
+
+    out = torch.ops.fxpr.rms_norm_fxp_residual(x, r, w, 1e-6, 64)
+    assert out.dtype == dtype
+    assert r.dtype == dtype
+    # `r` is mutated in place to (x + r).
+    expected_r = (x.to(torch.float32) + r_orig.to(torch.float32)).to(dtype)
+    atol, rtol = _DTYPE_TOL[dtype]
+    assert torch.allclose(r.to(torch.float32), expected_r.to(torch.float32),
+                          atol=atol, rtol=rtol)
+
+
+@requires_cuda
 def test_rms_norm_associativity_fixed_vs_float16():
-    # Squares are [4096, 1, 1, 1, 1], which produce order-dependent fp16 sums:
-    # ((4096 + 1) + 1 + 1 + 1) -> 4096, but (1 + 1 + 1 + 1 + 4096) -> 4100.
+    # fp16 sum is order-dependent here; the fxp kernel must not be.
     order_a = [64.0, 1.0, 1.0, 1.0, 1.0]
     order_b = [1.0, 1.0, 1.0, 1.0, 64.0]
 
@@ -103,5 +170,4 @@ def test_rms_norm_associativity_fixed_vs_float16():
     w = torch.ones((x.shape[1],), device="cuda", dtype=torch.float32)
     y = _run_rms_norm_kernel(x, w, eps=1e-6)
 
-    # With fixed-point sum of squares, the reduction is associative/order-invariant.
     assert torch.equal(y[1], y[0][perm])

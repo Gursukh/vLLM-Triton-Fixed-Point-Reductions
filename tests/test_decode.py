@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-import fxpr_vllm._cuda  # noqa: F401  (registers torch.ops.fxpr.*)
+import fxpr_vllm._cuda  # noqa: F401
 from tests.fixed_point_helpers import requires_cuda
 
 _BLOCK_SIZE = 16
@@ -9,13 +9,9 @@ _NUM_HEADS = 4
 _NUM_KV_HEADS = 2
 _HEAD_DIM = 32
 _SM_SCALE = 1.0 / (_HEAD_DIM**0.5)
-_FRAC_BITS = 14
 
 
-def _build_decode_inputs(seq_lens, num_blocks_per_seq):
-    """Build (q, kv_cache, query_start_loc, seq_lens, block_table) for a
-    decode batch. Each request has query_len=1; each seq spans
-    num_blocks_per_seq logical blocks of size _BLOCK_SIZE."""
+def _build_decode_inputs(seq_lens, num_blocks_per_seq, dtype=torch.float32):
     g = torch.Generator(device="cuda").manual_seed(2026)
     num_requests = len(seq_lens)
     total_blocks = num_requests * num_blocks_per_seq
@@ -25,21 +21,19 @@ def _build_decode_inputs(seq_lens, num_blocks_per_seq):
         device="cuda",
         dtype=torch.float32,
         generator=g,
-    )
-    # kv_cache shape: (num_blocks, 2, page_size, num_kv_heads, head_dim).
+    ).to(dtype)
     kv_cache = torch.randn(
         (total_blocks, 2, _BLOCK_SIZE, _NUM_KV_HEADS, _HEAD_DIM),
         device="cuda",
         dtype=torch.float32,
         generator=g,
-    )
+    ).to(dtype)
 
     query_start_loc = torch.arange(
         num_requests + 1, device="cuda", dtype=torch.int32
     )
     seq_lens_t = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
 
-    # Each request gets a contiguous slab of physical blocks.
     block_table = torch.arange(
         total_blocks, device="cuda", dtype=torch.int32
     ).reshape(num_requests, num_blocks_per_seq)
@@ -56,14 +50,13 @@ def _run_decode(q, kv_cache, query_start_loc, seq_lens, block_table, num_kv_spli
         query_start_loc,
         seq_lens,
         block_table,
-        1,  # max_query_len (decode)
-        None,  # alibi_slopes
-        True,  # is_causal
+        1,
+        None,
+        True,
         float(_SM_SCALE),
-        _FRAC_BITS,
-        32,  # fxp_int_bits
-        0.0,  # logit_softcap
-        0,  # window_size
+        32,
+        0.0,
+        0,
         int(num_kv_splits),
     )
     return o
@@ -72,8 +65,7 @@ def _run_decode(q, kv_cache, query_start_loc, seq_lens, block_table, num_kv_spli
 @requires_cuda
 @pytest.mark.parametrize("num_kv_splits", [1, 2, 4, 8])
 def test_decode_invariant_across_kv_splits(num_kv_splits):
-    """Decode (block_size=16, multi-block) must be bitwise-identical across kv_splits."""
-    seq_lens = [48, 48]  # 3 blocks per seq
+    seq_lens = [48, 48]
     q, kv_cache, qsl, sl, bt = _build_decode_inputs(seq_lens, num_blocks_per_seq=3)
 
     o_ref = _run_decode(q, kv_cache, qsl, sl, bt, num_kv_splits=1)
@@ -87,7 +79,6 @@ def test_decode_invariant_across_kv_splits(num_kv_splits):
 
 @requires_cuda
 def test_decode_deterministic_across_runs():
-    """Same decode inputs produce bitwise identical outputs across runs."""
     seq_lens = [32, 48, 16]
     q, kv_cache, qsl, sl, bt = _build_decode_inputs(seq_lens, num_blocks_per_seq=3)
 
@@ -97,3 +88,17 @@ def test_decode_deterministic_across_runs():
         assert torch.equal(first, again), (
             f"Non-deterministic decode: max diff = {(first - again).abs().max().item()}"
         )
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_decode_native_dtype(dtype):
+    seq_lens = [48, 32]
+    q, kv_cache, qsl, sl, bt = _build_decode_inputs(
+        seq_lens, num_blocks_per_seq=3, dtype=dtype
+    )
+
+    o = _run_decode(q, kv_cache, qsl, sl, bt, num_kv_splits=4)
+    assert o.dtype == dtype, f"output dtype {o.dtype} != input dtype {dtype}"
+    assert o.shape == q.shape
+    assert torch.isfinite(o.to(torch.float32)).all()

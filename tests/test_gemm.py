@@ -1,31 +1,17 @@
 import pytest
 import torch
 
-from tests.fixed_point_helpers import gemm_fxp_test, requires_cuda
-
-
-def _ordered_fp16_dot(
-    a_rows: list[list[float]], b_cols: list[list[float]]
-) -> torch.Tensor:
-    """Scalar fp16 dot-products accumulated left-to-right, to expose ordering effects."""
-    M = len(a_rows)
-    N = len(b_cols)
-    out = torch.zeros((M, N), device="cuda", dtype=torch.float16)
-    for i, row in enumerate(a_rows):
-        for j, col in enumerate(b_cols):
-            acc = torch.zeros((), device="cuda", dtype=torch.float16)
-            for a_val, b_val in zip(row, col):
-                a_t = torch.tensor(a_val, device="cuda", dtype=torch.float16)
-                b_t = torch.tensor(b_val, device="cuda", dtype=torch.float16)
-                acc = acc + a_t * b_t
-            out[i, j] = acc
-    return out
+from tests.fixed_point_helpers import (
+    gemm_fxp_test,
+    requires_cuda,
+    skip_if_dtype_unsupported,
+)
 
 
 @requires_cuda
 @pytest.mark.parametrize("M,N,K", [(4, 4, 16), (3, 7, 16), (1, 1, 32), (8, 16, 32)])
-def test_gemm_fixed_point_correctness(M, N, K):
-    """Fixed-point GEMM should closely match a plain float reference."""
+def test_gemm_correctness(M, N, K):
+    skip_if_dtype_unsupported(torch.float32)
     g = torch.Generator(device="cuda").manual_seed(42)
 
     a = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g)
@@ -41,7 +27,7 @@ def test_gemm_fixed_point_correctness(M, N, K):
 
 @requires_cuda
 def test_gemm_matches_torch():
-    """Fixed-point GEMM should closely match torch.matmul."""
+    skip_if_dtype_unsupported(torch.float32)
     g = torch.Generator(device="cuda").manual_seed(7)
 
     a = torch.randn((8, 16), device="cuda", dtype=torch.float32, generator=g)
@@ -57,7 +43,7 @@ def test_gemm_matches_torch():
 
 @requires_cuda
 def test_gemm_identity():
-    """A @ I = A."""
+    skip_if_dtype_unsupported(torch.float32)
     K = 16
     g = torch.Generator(device="cuda").manual_seed(0)
     a = torch.randn((4, K), device="cuda", dtype=torch.float32, generator=g)
@@ -69,7 +55,7 @@ def test_gemm_identity():
 
 @requires_cuda
 def test_gemm_zero_matrix():
-    """A @ 0 = 0."""
+    skip_if_dtype_unsupported(torch.float32)
     a = torch.ones((4, 16), device="cuda", dtype=torch.float32)
     b = torch.zeros((16, 4), device="cuda", dtype=torch.float32)
 
@@ -79,7 +65,7 @@ def test_gemm_zero_matrix():
 
 @requires_cuda
 def test_gemm_single_row_col():
-    """(1,16) @ (16,1) single-element output."""
+    skip_if_dtype_unsupported(torch.float32)
     g = torch.Generator(device="cuda").manual_seed(0)
     a = torch.randn((1, 16), device="cuda", dtype=torch.float32, generator=g)
     b = torch.randn((16, 1), device="cuda", dtype=torch.float32, generator=g)
@@ -91,7 +77,7 @@ def test_gemm_single_row_col():
 
 @requires_cuda
 def test_gemm_non_square():
-    """Non-square dimensions: (2,16) @ (16,3) -> (2,3)."""
+    skip_if_dtype_unsupported(torch.float32)
     g = torch.Generator(device="cuda").manual_seed(99)
     a = torch.randn((2, 16), device="cuda", dtype=torch.float32, generator=g)
     b = torch.randn((16, 3), device="cuda", dtype=torch.float32, generator=g)
@@ -102,59 +88,153 @@ def test_gemm_non_square():
     assert torch.allclose(got, ref, atol=5e-4, rtol=5e-4)
 
 
-@requires_cuda
-def test_gemm_associativity_fixed_vs_float16():
-    """Demonstrate that fp16 dot-products are order-dependent, while the
-    fixed-point GEMM gives identical results for permuted K-dimensions.
-    """
-    # K=16: first element is large (2048), rest are 1.0.
-    # At 2048 the fp16 step size is 2, so 2048+1 = 2048 in fp16.
-    # Forward:  (2048 + 1 + 1 + ... + 1) stays at 2048.
-    # Reversed: (1 + 1 + ... + 1) = 15, then 15 + 2048 = 2063 → rounds to 2064.
-    K = 16
-    a_row = [2048.0] + [1.0] * (K - 1)
-    b_col = [1.0] * K
-
-    fp16_fwd = _ordered_fp16_dot([a_row], [b_col])
-    a_row_rev = list(reversed(a_row))
-    b_col_rev = list(reversed(b_col))
-    fp16_rev = _ordered_fp16_dot([a_row_rev], [b_col_rev])
-    assert (
-        fp16_fwd.item() != fp16_rev.item()
-    ), "fp16 sums should differ with reversed order"
-
-    a_fwd = torch.tensor([a_row], device="cuda", dtype=torch.float32)
-    b_fwd = torch.tensor([[v] for v in b_col], device="cuda", dtype=torch.float32)
-
-    perm = list(reversed(range(K)))
-    a_rev = a_fwd[:, perm]
-    b_rev = b_fwd[perm, :]
-
-    c_fwd = gemm_fxp_test(a_fwd, b_fwd)
-    c_rev = gemm_fxp_test(a_rev, b_rev)
-
-    assert torch.equal(
-        c_fwd, c_rev
-    ), f"Fixed-point GEMM should be order-invariant, got {c_fwd.item()} vs {c_rev.item()}"
+_DTYPE_TOL = {
+    torch.float32: (5e-4, 5e-4),
+    torch.float16: (1e-2, 1e-2),
+    torch.bfloat16: (5e-2, 5e-2),
+}
 
 
 @requires_cuda
-def test_gemm_element_permutation_invariance():
-    """Arbitrarily permuting the K dimension of both A and B must yield
-    bitwise identical results.
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("M,N,K", [(8, 16, 32), (4, 4, 64)])
+def test_gemm_native_dtype_vec_path(dtype, M, N, K):
+    skip_if_dtype_unsupported(dtype)
+    g = torch.Generator(device="cuda").manual_seed(42)
+    a_f32 = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g) * 0.5
+    b_f32 = torch.randn((K, N), device="cuda", dtype=torch.float32, generator=g) * 0.5
 
-    Since every individual product a[m,k]*b[k,n] is converted to
-    fixed-point before any reduction, the entire K-sum is an integer
-    addition, exact and commutative, so any permutation of K gives
-    the same answer.
-    """
+    a = a_f32.to(dtype)
+    b = b_f32.to(dtype)
+
+    got = gemm_fxp_test(a, b)
+    assert got.dtype == dtype, f"output dtype {got.dtype} != input dtype {dtype}"
+
+    ref = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(dtype)
+
+    atol, rtol = _DTYPE_TOL[dtype]
+    assert torch.allclose(
+        got.to(torch.float32), ref.to(torch.float32), atol=atol, rtol=rtol
+    ), f"max error = {(got.to(torch.float32) - ref.to(torch.float32)).abs().max().item()} dtype={dtype}"
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_gemm_native_dtype_scalar_fallback(dtype):
+    skip_if_dtype_unsupported(dtype)
+    # K=33 hits the K-tail path.
+    M, N, K = 4, 4, 33
+    g = torch.Generator(device="cuda").manual_seed(0)
+    a_f32 = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g) * 0.5
+    b_f32 = torch.randn((K, N), device="cuda", dtype=torch.float32, generator=g) * 0.5
+
+    a = a_f32.to(dtype)
+    b = b_f32.to(dtype)
+
+    got = gemm_fxp_test(a, b)
+    assert got.dtype == dtype
+
+    ref = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(dtype)
+    atol, rtol = _DTYPE_TOL[dtype]
+    assert torch.allclose(
+        got.to(torch.float32), ref.to(torch.float32), atol=atol, rtol=rtol
+    )
+
+
+@requires_cuda
+def test_gemm_deterministic_across_runs():
+    skip_if_dtype_unsupported(torch.float32)
+    g = torch.Generator(device="cuda").manual_seed(77)
+    a = torch.randn((8, 32), device="cuda", dtype=torch.float32, generator=g)
+    b = torch.randn((32, 8), device="cuda", dtype=torch.float32, generator=g)
+
+    results = [gemm_fxp_test(a, b) for _ in range(5)]
+    for r in results[1:]:
+        assert torch.equal(results[0], r)
+
+
+@requires_cuda
+def test_gemm_bias_none_matches_no_bias():
+    skip_if_dtype_unsupported(torch.float32)
+    g = torch.Generator(device="cuda").manual_seed(11)
+    a = torch.randn((8, 16), device="cuda", dtype=torch.float32, generator=g)
+    b = torch.randn((16, 8), device="cuda", dtype=torch.float32, generator=g)
+
+    with_none = gemm_fxp_test(a, b, bias=None)
+    ref = torch.matmul(a, b)
+    assert torch.allclose(with_none, ref, atol=5e-4, rtol=5e-4)
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("M,N,K", [(8, 16, 32), (4, 4, 64), (130, 130, 33)])
+def test_gemm_with_bias(dtype, M, N, K):
+    skip_if_dtype_unsupported(dtype)
+    g = torch.Generator(device="cuda").manual_seed(123)
+    a_f32 = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g) * 0.5
+    b_f32 = torch.randn((K, N), device="cuda", dtype=torch.float32, generator=g) * 0.5
+    bias_f32 = torch.randn((N,), device="cuda", dtype=torch.float32, generator=g)
+
+    a = a_f32.to(dtype)
+    b = b_f32.to(dtype)
+    bias = bias_f32.to(dtype)
+
+    got = gemm_fxp_test(a, b, bias=bias)
+    assert got.dtype == dtype
+    assert got.shape == (M, N)
+
+    ref = (
+        torch.matmul(a.to(torch.float32), b.to(torch.float32)) + bias_f32
+    ).to(dtype)
+
+    atol, rtol = _DTYPE_TOL[dtype]
+    assert torch.allclose(
+        got.to(torch.float32), ref.to(torch.float32), atol=atol, rtol=rtol
+    ), f"max error = {(got.to(torch.float32) - ref.to(torch.float32)).abs().max().item()} dtype={dtype}"
+
+
+@requires_cuda
+def test_gemm_large_shape():
+    skip_if_dtype_unsupported(torch.float32)
+    # Spans multiple BM=BN=128 tiles in both dimensions.
+    M, K, N = 256, 256, 256
+    g = torch.Generator(device="cuda").manual_seed(5)
+    a = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g) * 0.3
+    b = torch.randn((K, N), device="cuda", dtype=torch.float32, generator=g) * 0.3
+    bias = torch.randn((N,), device="cuda", dtype=torch.float32, generator=g)
+
+    got = gemm_fxp_test(a, b, bias=bias)
+    ref = torch.matmul(a, b) + bias
+
+    assert torch.allclose(got, ref, atol=1e-3, rtol=1e-3), (
+        f"max error = {(got - ref).abs().max().item()}"
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_gemm_ktile_permutation_invariance(dtype):
+    # Fxp reduction is across K-tiles of width kBK, so permuting whole
+    # tiles must be bit-exact. (Element-level permutation isn't.)
+    skip_if_dtype_unsupported(dtype)
     g = torch.Generator(device="cuda").manual_seed(123)
 
-    M, K, N = 4, 32, 4
-    a = torch.randn((M, K), device="cuda", dtype=torch.float32, generator=g)
-    b = torch.randn((K, N), device="cuda", dtype=torch.float32, generator=g)
+    K_TILE_BY_DTYPE = {
+        torch.float32: 16,
+        torch.float16: 32,
+        torch.bfloat16: 32,
+    }
+    K_TILE = K_TILE_BY_DTYPE[dtype]
+    NUM_TILES = 4
+    M, K, N = 4, K_TILE * NUM_TILES, 4
+    a = torch.randn((M, K), device="cuda", dtype=dtype, generator=g)
+    b = torch.randn((K, N), device="cuda", dtype=dtype, generator=g)
 
-    perm = torch.randperm(K, device="cuda")
+    tile_perm = torch.randperm(NUM_TILES, device="cuda")
+    perm = torch.cat([
+        torch.arange(t * K_TILE, (t + 1) * K_TILE, device="cuda")
+        for t in tile_perm
+    ])
     a_perm = a[:, perm]
     b_perm = b[perm, :]
 
@@ -167,31 +247,45 @@ def test_gemm_element_permutation_invariance():
 
 
 @requires_cuda
-@pytest.mark.parametrize("int_bits,frac_bits", [(16, 8), (32, 16), (64, 32)])
-def test_gemm_parametrized_int_bits(int_bits, frac_bits):
-    """Exercise _int_dtype_for_bits across all supported (int_bits, frac_bits)."""
-    g = torch.Generator(device="cuda").manual_seed(int_bits)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_gemm_batch_size_invariance(dtype):
+    # The whole point of fxp: c[m, :] is identical regardless of batch.
+    skip_if_dtype_unsupported(dtype)
+    g = torch.Generator(device="cuda").manual_seed(2026)
 
-    # Keep magnitudes small so partial products fit even at int_bits=16, frac_bits=8.
-    a = torch.randn((4, 16), device="cuda", dtype=torch.float32, generator=g) * 0.25
-    b = torch.randn((16, 4), device="cuda", dtype=torch.float32, generator=g) * 0.25
+    K, N = 64, 16
+    a_full = torch.randn((128, K), device="cuda", dtype=dtype, generator=g)
+    b = torch.randn((K, N), device="cuda", dtype=dtype, generator=g)
 
-    got = gemm_fxp_test(a, b, frac_bits=frac_bits, fxp_int_bits=int_bits)
-    ref = torch.matmul(a, b)
+    rows = [0, 3, 17, 64, 127]
+    refs = {m: gemm_fxp_test(a_full[m:m + 1], b)[0] for m in rows}
 
-    assert torch.allclose(got, ref, atol=5e-2, rtol=5e-2), (
-        f"max error = {(got - ref).abs().max().item()} "
-        f"at int_bits={int_bits} frac_bits={frac_bits}"
-    )
+    for batch in (1, 4, 16, 128):
+        for m in rows:
+            if m >= batch:
+                continue
+            sub = a_full[:batch].clone()
+            sub[m] = a_full[m]
+            out = gemm_fxp_test(sub, b)
+            assert torch.equal(out[m], refs[m]), (
+                f"row {m} differs at batch={batch}, dtype={dtype}: "
+                f"max diff = {(out[m] - refs[m]).abs().max().item()}"
+            )
 
 
 @requires_cuda
-def test_gemm_deterministic_across_runs():
-    """The same inputs must always produce bitwise identical outputs."""
-    g = torch.Generator(device="cuda").manual_seed(77)
-    a = torch.randn((8, 32), device="cuda", dtype=torch.float32, generator=g)
-    b = torch.randn((32, 8), device="cuda", dtype=torch.float32, generator=g)
+@pytest.mark.parametrize("int_bits", [32, 64])
+def test_gemm_parametrized_int_bits(int_bits):
+    skip_if_dtype_unsupported(torch.float32)
+    g = torch.Generator(device="cuda").manual_seed(int_bits)
 
-    results = [gemm_fxp_test(a, b) for _ in range(5)]
-    for r in results[1:]:
-        assert torch.equal(results[0], r)
+    # Small magnitudes to keep partial products in range at int_bits=32.
+    a = torch.randn((4, 16), device="cuda", dtype=torch.float32, generator=g) * 0.25
+    b = torch.randn((16, 4), device="cuda", dtype=torch.float32, generator=g) * 0.25
+
+    got = gemm_fxp_test(a, b, fxp_int_bits=int_bits)
+    ref = torch.matmul(a, b)
+
+    assert torch.allclose(got, ref, atol=5e-2, rtol=5e-2), (
+        f"max error = {(got - ref).abs().max().item()} at int_bits={int_bits}"
+    )

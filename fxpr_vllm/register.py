@@ -13,7 +13,6 @@ _registered = False
 
 
 def register() -> None:
-    """vLLM plugin entry point. Idempotent; rolls back on failure."""
     global _registered
     if _registered:
         return
@@ -23,8 +22,7 @@ def register() -> None:
 
     cfg = get_runtime_config()
     logger.info(
-        "Runtime Config: frac_bits=%d fxp_int_bits=%d num_kv_splits=%d",
-        cfg.frac_bits,
+        "Runtime Config: fxp_int_bits=%d num_kv_splits=%d",
         cfg.fxp_int_bits,
         cfg.num_kv_splits,
     )
@@ -64,7 +62,7 @@ def _undo_rms_norm() -> None:
         from vllm.model_executor.custom_op import op_registry
 
         op_registry.pop("rms_norm", None)
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         logger.warning("RMSNorm rollback failed: %s", e)
 
 
@@ -75,5 +73,5 @@ def _undo_sampler() -> None:
         if getattr(Sampler, "_fxp_logprobs_patched", False):
             del Sampler.compute_logprobs
             Sampler._fxp_logprobs_patched = False
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         logger.warning("Sampler rollback failed: %s", e)

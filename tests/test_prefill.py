@@ -13,7 +13,6 @@ def _ref_attention(
     is_causal: bool,
     sm_scale: float,
 ) -> torch.Tensor:
-    """Reference multi-head attention computed per-sequence with PyTorch."""
     total_tokens, num_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     kv_group = num_heads // num_kv_heads
@@ -41,7 +40,6 @@ def _ref_attention(
 
 
 def _make_inputs(batch, seq_lens, num_heads, num_kv_heads, head_dim, seed=42):
-    """Build packed QKV tensors and metadata for prefill."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     total = sum(seq_lens)
     q = torch.randn(
@@ -72,7 +70,6 @@ _PREFILL_SM_SCALE = 1.0 / (_PREFILL_HEAD_DIM**0.5)
 @requires_cuda
 @pytest.mark.parametrize("batch", [1, 2])
 def test_prefill_correctness_causal(batch):
-    """Fixed-point prefill attention should closely match a reference implementation (causal)."""
     seq_lens = [_PREFILL_SEQ_LEN] * batch
     q, k, v, o, b_start_loc, b_seq_len = _make_inputs(
         batch, seq_lens, _PREFILL_HEADS, _PREFILL_KV_HEADS, _PREFILL_HEAD_DIM
@@ -100,7 +97,6 @@ def test_prefill_correctness_causal(batch):
 
 @requires_cuda
 def test_prefill_correctness_non_causal():
-    """Fixed-point prefill attention should closely match reference (non-causal)."""
     q, k, v, o, b_start_loc, b_seq_len = _make_inputs(
         1, [_PREFILL_SEQ_LEN], _PREFILL_HEADS, _PREFILL_KV_HEADS, _PREFILL_HEAD_DIM
     )
@@ -127,7 +123,6 @@ def test_prefill_correctness_non_causal():
 
 @requires_cuda
 def test_prefill_variable_seq_lens():
-    """Batches with different sequence lengths should each be correct."""
     seq_lens = [_PREFILL_SEQ_LEN // 2, _PREFILL_SEQ_LEN, _PREFILL_SEQ_LEN * 3 // 4]
     q, k, v, o, b_start_loc, b_seq_len = _make_inputs(
         3, seq_lens, _PREFILL_HEADS, _PREFILL_KV_HEADS, _PREFILL_HEAD_DIM, seed=99
@@ -160,14 +155,12 @@ def _float_attention_row(
     sm_scale: float,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Scalar attention for a single query, accumulated left-to-right in *dtype*."""
     seq_len = k_rows.shape[0]
     head_dim = q_row.shape[0]
 
     q_c = q_row.to(dtype)
     k_c = k_rows.to(dtype)
 
-    # Dot products accumulated one element at a time
     scores = torch.zeros(seq_len, device="cuda", dtype=dtype)
     for j in range(seq_len):
         dot = torch.zeros((), device="cuda", dtype=dtype)
@@ -175,7 +168,6 @@ def _float_attention_row(
             dot = dot + q_c[d] * k_c[j, d]
         scores[j] = dot * sm_scale
 
-    # Softmax in the same dtype
     scores_max = scores.max()
     exp_scores = torch.zeros(seq_len, device="cuda", dtype=dtype)
     exp_sum = torch.zeros((), device="cuda", dtype=dtype)
@@ -184,7 +176,6 @@ def _float_attention_row(
         exp_sum = exp_sum + exp_scores[j]
     p = exp_scores / exp_sum
 
-    # Weighted sum of V rows
     v_c = v_rows.to(dtype)
     out = torch.zeros(head_dim, device="cuda", dtype=dtype)
     for j in range(seq_len):
@@ -195,9 +186,6 @@ def _float_attention_row(
 
 @requires_cuda
 def test_float_accumulation_is_order_dependent():
-    """fp32 attention accumulation is order-dependent (pure-torch demonstration).
-    The kernel-side invariance is exercised by
-    test_fixedpoint_prefill_is_permutation_equivariant."""
     seq_len, head_dim = 3, 16
     q_row = torch.ones(head_dim, device="cuda", dtype=torch.float32)
     k_rows = torch.ones(seq_len, head_dim, device="cuda", dtype=torch.float32)
@@ -215,14 +203,12 @@ def test_float_accumulation_is_order_dependent():
     )
 
     assert not torch.equal(out_fwd[perm], out_perm), (
-        "fp32 attention should differ with permuted KV order due to "
-        "catastrophic cancellation (1e30 + 1e-30 ≠ 1e-30 + 1e30 in fp32)"
+        "fp32 attention should differ with permuted KV order"
     )
 
 
 @requires_cuda
 def test_fixedpoint_prefill_is_permutation_equivariant():
-    """Fixed-point prefill must produce the same output regardless of KV order."""
     seq_len = _PREFILL_SEQ_LEN
     g = torch.Generator(device="cuda").manual_seed(7)
     shape = (seq_len, _PREFILL_HEADS, _PREFILL_HEAD_DIM)
@@ -261,14 +247,13 @@ def test_fixedpoint_prefill_is_permutation_equivariant():
     )
 
     assert torch.equal(o_orig, o_perm), (
-        f"Fixed-point prefill should be KV-permutation invariant, "
+        f"fxp prefill should be KV-permutation invariant, "
         f"max diff = {(o_orig - o_perm).abs().max().item()}"
     )
 
 
 @requires_cuda
 def test_prefill_deterministic_across_runs():
-    """The same inputs must always produce bitwise identical outputs."""
     q, k, v, _, b_start_loc, b_seq_len = _make_inputs(
         1,
         [_PREFILL_SEQ_LEN],

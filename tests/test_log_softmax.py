@@ -1,14 +1,13 @@
 import pytest
 import torch
 
-import fxpr_vllm._cuda  # noqa: F401  (registers torch.ops.fxpr.*)
+import fxpr_vllm._cuda  # noqa: F401
 from fxpr_vllm.sampling import deterministic_log_softmax
 from tests.fixed_point_helpers import requires_cuda
 
 
 @requires_cuda
 def test_log_softmax_deterministic_across_runs():
-    """deterministic_log_softmax must be bitwise-stable across runs."""
     g = torch.Generator(device="cuda").manual_seed(123)
     logits = torch.randn((4, 1024), device="cuda", dtype=torch.float32, generator=g)
 
@@ -23,7 +22,6 @@ def test_log_softmax_deterministic_across_runs():
 
 @requires_cuda
 def test_log_softmax_matches_torch_log_softmax():
-    """Output should be close to torch.log_softmax for typical logits."""
     g = torch.Generator(device="cuda").manual_seed(7)
     logits = torch.randn((2, 256), device="cuda", dtype=torch.float32, generator=g)
 
@@ -35,10 +33,34 @@ def test_log_softmax_matches_torch_log_softmax():
     )
 
 
+_DTYPE_TOL = {
+    torch.float32: (5e-3, 5e-3),
+    torch.float16: (2e-2, 2e-2),
+    torch.bfloat16: (5e-2, 5e-2),
+}
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_log_softmax_native_dtype(dtype):
+    g = torch.Generator(device="cuda").manual_seed(7)
+    logits_f32 = torch.randn((2, 256), device="cuda", dtype=torch.float32, generator=g)
+    logits = logits_f32.to(dtype)
+
+    got = deterministic_log_softmax(logits)
+    assert got.dtype == dtype, f"output dtype {got.dtype} != {dtype}"
+
+    ref = torch.log_softmax(logits.to(torch.float32), dim=-1).to(dtype)
+
+    atol, rtol = _DTYPE_TOL[dtype]
+    assert torch.allclose(
+        got.to(torch.float32), ref.to(torch.float32), atol=atol, rtol=rtol
+    ), f"max error = {(got.to(torch.float32) - ref.to(torch.float32)).abs().max().item()}"
+
+
 @requires_cuda
 @pytest.mark.parametrize("dim", [-1, 0])
 def test_log_softmax_dim_handling(dim):
-    """Reducing over a non-last dim should still be deterministic."""
     g = torch.Generator(device="cuda").manual_seed(11)
     logits = torch.randn((8, 32), device="cuda", dtype=torch.float32, generator=g)
 

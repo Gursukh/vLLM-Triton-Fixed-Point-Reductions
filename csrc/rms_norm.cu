@@ -1,6 +1,5 @@
-// RMSNorm with deterministic fixed-point sum of squares. One CTA per
-// row; warp-shuffle + shared-memory integer reduction (associative).
-// Fused-residual variant does residual += x in fp32 in place.
+// One CTA per row; warp-shuffle + smem integer reduction.
+// Residual variant adds x into residual in fp32, in place.
 
 #include "fixed_point.cuh"
 #include "ops_internal.h"
@@ -10,6 +9,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
 namespace fxpr {
 namespace detail {
 
@@ -18,8 +20,7 @@ namespace {
 constexpr int kMaxThreads = 1024;
 constexpr int kWarpSize = 32;
 
-// Cap on the pass-1 → pass-2 smem cache. Sized to stay under the 48KB
-// per-CTA budget on every supported arch.
+// Stays inside the 48KB per-CTA smem budget on every supported arch.
 constexpr int kSmemCacheElems = 8192;
 
 template <typename FxpInt>
@@ -30,44 +31,37 @@ __device__ __forceinline__ FxpInt warp_reduce_sum(FxpInt v) {
   return v;
 }
 
-template <typename FxpInt, bool kHasResidual, typename WeightT>
+template <typename FxpInt, bool kHasResidual, typename IOFloat>
 __global__ void rms_norm_kernel(
-    const float* __restrict__ x,
-    const WeightT* __restrict__ w,
-    float* __restrict__ y,
-    float* __restrict__ residual,
+    const IOFloat* __restrict__ x,
+    const IOFloat* __restrict__ w,
+    IOFloat* __restrict__ y,
+    IOFloat* __restrict__ residual,
     int64_t stride_x,
     int hidden_size,
-    float eps,
-    int frac_bits) {
+    float eps) {
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
   const int nthreads = blockDim.x;
 
-  const float* x_row = x + row * stride_x;
-  float* y_row = y + row * stride_x;
-  float* r_row = kHasResidual ? residual + row * stride_x : nullptr;
+  const IOFloat* x_row = x + row * stride_x;
+  IOFloat* y_row = y + row * stride_x;
+  IOFloat* r_row = kHasResidual ? residual + row * stride_x : nullptr;
 
-  // Stage x (post-residual when fused) into smem when it fits, so pass 2
-  // can read from there instead of HBM. Bit-identical fallback otherwise.
   extern __shared__ float x_cache[];
   const bool use_cache = (hidden_size <= kSmemCacheElems);
 
-  // Pass 1: per-thread fixed-point partial sum of squares. Residual
-  // fusion writes the new residual once here, so x flows through global
-  // memory twice or once when use_cache is true.
   FxpInt partial = 0;
   for (int i = tid; i < hidden_size; i += nthreads) {
-    float xi = x_row[i];
+    float xi = static_cast<float>(x_row[i]);
     if constexpr (kHasResidual) {
-      const float ri = r_row[i];
-      // The __fmul_rn in the square below blocks FMA contraction with this add.
+      const float ri = static_cast<float>(r_row[i]);
       xi = xi + ri;
-      r_row[i] = xi;
+      r_row[i] = static_cast<IOFloat>(xi);
     }
     if (use_cache) x_cache[i] = xi;
-    const float xi2 = __fmul_rn(xi, xi);
-    partial += float_to_fixed<FxpInt>(xi2, frac_bits);
+    const float xi2 = xi * xi;
+    partial += float_to_fixed<FxpInt>(xi2);
   }
 
   partial = warp_reduce_sum<FxpInt>(partial);
@@ -93,28 +87,26 @@ __global__ void rms_norm_kernel(
   __syncthreads();
   total = warp_sums[0];
 
-  const float sum_f = fixed_to_float<FxpInt>(total, frac_bits);
+  const float sum_f = fixed_to_float<FxpInt>(total);
   const float mean_sq = fmaxf(sum_f / static_cast<float>(hidden_size), 0.0f);
   const float rrms = rsqrtf(mean_sq + eps);
 
-  // Pass 2: y = x * w * rrms.
   for (int i = tid; i < hidden_size; i += nthreads) {
     const float xi = use_cache
         ? x_cache[i]
-        : (kHasResidual ? r_row[i] : x_row[i]);
+        : static_cast<float>(kHasResidual ? r_row[i] : x_row[i]);
     const float wi = static_cast<float>(w[i]);
-    y_row[i] = xi * wi * rrms;
+    y_row[i] = static_cast<IOFloat>(xi * wi * rrms);
   }
 }
 
-template <typename FxpInt, bool kHasResidual, typename WeightT>
+template <typename FxpInt, bool kHasResidual, typename IOFloat>
 void launch_typed(
     const at::Tensor& x_2d,
     const at::Tensor& w,
     at::Tensor& y_2d,
     at::Tensor* residual_2d_ptr,
-    double eps,
-    int64_t frac_bits) {
+    double eps) {
   const int batch = x_2d.size(0);
   const int hidden = x_2d.size(1);
   if (batch == 0 || hidden == 0) return;
@@ -127,15 +119,14 @@ void launch_typed(
       (hidden <= kSmemCacheElems) ? hidden * sizeof(float) : 0;
 
   auto stream = at::cuda::getCurrentCUDAStream();
-  rms_norm_kernel<FxpInt, kHasResidual, WeightT><<<batch, block, smem_bytes, stream>>>(
-      x_2d.data_ptr<float>(),
-      w.data_ptr<WeightT>(),
-      y_2d.data_ptr<float>(),
-      kHasResidual ? residual_2d_ptr->data_ptr<float>() : nullptr,
+  rms_norm_kernel<FxpInt, kHasResidual, IOFloat><<<batch, block, smem_bytes, stream>>>(
+      x_2d.data_ptr<IOFloat>(),
+      w.data_ptr<IOFloat>(),
+      y_2d.data_ptr<IOFloat>(),
+      kHasResidual ? residual_2d_ptr->data_ptr<IOFloat>() : nullptr,
       x_2d.stride(0),
       hidden,
-      static_cast<float>(eps),
-      static_cast<int>(frac_bits));
+      static_cast<float>(eps));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -145,24 +136,27 @@ void launch(
     const at::Tensor& w,
     at::Tensor& y_2d,
     at::Tensor* residual_2d_ptr,
-    double eps,
-    int64_t frac_bits) {
-  switch (w.scalar_type()) {
+    double eps) {
+  // Tying weight dtype to input keeps the dispatch table small.
+  TORCH_CHECK(w.scalar_type() == x_2d.scalar_type(),
+              "rms_norm: weight dtype must match input dtype (got w=",
+              w.scalar_type(), ", x=", x_2d.scalar_type(), ")");
+  switch (x_2d.scalar_type()) {
     case at::kFloat:
       launch_typed<FxpInt, kHasResidual, float>(
-          x_2d, w, y_2d, residual_2d_ptr, eps, frac_bits);
+          x_2d, w, y_2d, residual_2d_ptr, eps);
       break;
     case at::kHalf:
       launch_typed<FxpInt, kHasResidual, at::Half>(
-          x_2d, w, y_2d, residual_2d_ptr, eps, frac_bits);
+          x_2d, w, y_2d, residual_2d_ptr, eps);
       break;
     case at::kBFloat16:
       launch_typed<FxpInt, kHasResidual, at::BFloat16>(
-          x_2d, w, y_2d, residual_2d_ptr, eps, frac_bits);
+          x_2d, w, y_2d, residual_2d_ptr, eps);
       break;
     default:
-      TORCH_CHECK(false, "rms_norm: unsupported weight dtype ",
-                  w.scalar_type());
+      TORCH_CHECK(false, "rms_norm: unsupported input dtype ",
+                  x_2d.scalar_type());
   }
 }
 
@@ -176,7 +170,6 @@ at::Tensor rms_norm_dispatch(
     at::Tensor* residual,
     at::Tensor w,
     double eps,
-    int64_t frac_bits,
     int64_t int_bits) {
   const c10::cuda::CUDAGuard device_guard(x.device());
   auto x_2d = as_2d(x).contiguous();
@@ -193,13 +186,13 @@ at::Tensor rms_norm_dispatch(
 
   switch (int_bits) {
     case 16:
-      launch<int16_t, kHasResidual>(x_2d, w, y_2d, r_2d_ptr, eps, frac_bits);
+      launch<int16_t, kHasResidual>(x_2d, w, y_2d, r_2d_ptr, eps);
       break;
     case 32:
-      launch<int32_t, kHasResidual>(x_2d, w, y_2d, r_2d_ptr, eps, frac_bits);
+      launch<int32_t, kHasResidual>(x_2d, w, y_2d, r_2d_ptr, eps);
       break;
     case 64:
-      launch<int64_t, kHasResidual>(x_2d, w, y_2d, r_2d_ptr, eps, frac_bits);
+      launch<int64_t, kHasResidual>(x_2d, w, y_2d, r_2d_ptr, eps);
       break;
   }
 
@@ -218,10 +211,9 @@ at::Tensor rms_norm_fxp_run(
     at::Tensor x,
     at::Tensor w,
     double eps,
-    int64_t frac_bits,
     int64_t int_bits) {
   return rms_norm_dispatch<false>(
-      std::move(x), nullptr, std::move(w), eps, frac_bits, int_bits);
+      std::move(x), nullptr, std::move(w), eps, int_bits);
 }
 
 at::Tensor rms_norm_fxp_residual_run(
@@ -229,10 +221,9 @@ at::Tensor rms_norm_fxp_residual_run(
     at::Tensor residual,
     at::Tensor w,
     double eps,
-    int64_t frac_bits,
     int64_t int_bits) {
   return rms_norm_dispatch<true>(
-      std::move(x), &residual, std::move(w), eps, frac_bits, int_bits);
+      std::move(x), &residual, std::move(w), eps, int_bits);
 }
 
 }  // namespace detail

@@ -14,12 +14,12 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 
-from . import _cuda  # noqa: F401  (registers torch.ops.fxpr.*)
+from . import _cuda  # noqa: F401
 from .config import get_runtime_config
 
 logger = logging.getLogger("fxpr_vllm")
 
-# Kernel does softmax in the log2 domain; slopes are pre-multiplied by 1/ln(2).
+# Softmax is in log2 space; pre-scale alibi slopes by 1/ln(2).
 RCP_LN2 = 1.4426950408889634
 
 _flash_meta_cls: type[AttentionMetadata] | None = None
@@ -27,7 +27,6 @@ _flash_builder_cls: type[AttentionMetadataBuilder] | None = None
 
 
 def _lazy_import_flash_meta() -> None:
-    """Reuse FlashAttention's metadata/builder; deferred to avoid CUDA side effects at import."""
     global _flash_meta_cls, _flash_builder_cls
     if _flash_meta_cls is None:
         from vllm.v1.attention.backends.flash_attn import (
@@ -40,8 +39,6 @@ def _lazy_import_flash_meta() -> None:
 
 
 class DeterministicAttentionBackend(AttentionBackend):
-    """Fixed-point deterministic attention backend; reuses FlashAttention metadata/builder."""
-
     accept_output_buffer: bool = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
@@ -120,8 +117,6 @@ class DeterministicAttentionImpl(AttentionImpl):
         kv_cache_dtype: str = "auto",
         logits_soft_cap: float | None = None,
         attn_type: AttentionType | None = AttentionType.DECODER,
-        # Swallow extras so we stay compatible as more config 
-        # options are added
         *_extra_positional,
         **kwargs,
     ) -> None:
@@ -148,7 +143,6 @@ class DeterministicAttentionImpl(AttentionImpl):
         self.logits_soft_cap = float(logits_soft_cap) if logits_soft_cap else 0.0
         self.window_size = int(sliding_window) if sliding_window else 0
         self.attn_type = attn_type
-        self.frac_bits = cfg.frac_bits
         self.fxp_int_bits = cfg.fxp_int_bits
         self.num_kv_splits = cfg.num_kv_splits
 
@@ -196,7 +190,6 @@ class DeterministicAttentionImpl(AttentionImpl):
             output = output.view(num_tokens, self.num_heads, self.head_size)
 
         if attn_metadata is None:
-            # Profiling pass: metadata not built yet.
             output.zero_()
             return output.view(num_tokens, self.num_heads * self.head_size)
 
@@ -208,21 +201,18 @@ class DeterministicAttentionImpl(AttentionImpl):
         block_table = attn_metadata.block_table
         max_query_len = int(attn_metadata.max_query_len)
 
-        # Q and KV must share dtype; kernel widens to fp32 internally.
+        # Q/KV/output must share dtype.
         if query.dtype != kv_cache.dtype:
             q_in = query.to(kv_cache.dtype)
         else:
             q_in = query
-        out_fp32 = (
-            output
-            if output.dtype == torch.float32
-            else torch.empty_like(output, dtype=torch.float32)
-        )
+        if output.dtype != q_in.dtype:
+            output = output.to(q_in.dtype)
 
         torch.ops.fxpr.unified_attention_fxp(
             q_in,
             kv_cache,
-            out_fp32,
+            output,
             query_start_loc,
             seq_lens,
             block_table,
@@ -230,15 +220,11 @@ class DeterministicAttentionImpl(AttentionImpl):
             self.alibi_slopes,
             True,
             float(self.scale),
-            int(self.frac_bits),
             int(self.fxp_int_bits),
             float(self.logits_soft_cap),
             int(self.window_size),
             int(self.num_kv_splits),
         )
-
-        if out_fp32.data_ptr() != output.data_ptr():
-            output.copy_(out_fp32.to(output.dtype))
 
         return output.view(num_tokens, self.num_heads * self.head_size)
 

@@ -1,5 +1,3 @@
-"""Monkey-patches for vLLM internals lacking official extension points."""
-
 from __future__ import annotations
 
 import logging
@@ -9,11 +7,6 @@ logger = logging.getLogger("fxpr_vllm")
 
 
 def patch_rms_norm() -> int:
-    """Install DeterministicRMSNorm and rebind already-imported model modules.
-
-    Idempotent. Modules imported after this call keep the original symbol
-    (re-call to rebind them); the op-registry swap still intercepts most paths.
-    """
     from vllm.model_executor.custom_op import op_registry, op_registry_oot
     import vllm.model_executor.layers.layernorm as layernorm_mod
 
@@ -29,6 +22,7 @@ def patch_rms_norm() -> int:
     if original_rms_norm is not DeterministicRMSNorm:
         layernorm_mod.RMSNorm = DeterministicRMSNorm
 
+    # Rebind models that already imported the original RMSNorm symbol.
     patched = 0
     for mod_name, mod in list(sys.modules.items()):
         if mod is None or not mod_name.startswith("vllm.model_executor.models."):
@@ -47,7 +41,6 @@ def patch_rms_norm() -> int:
 
 
 def patch_attention_backend() -> None:
-    """Bind the deterministic attention backend to vLLM's CUSTOM enum slot."""
     from vllm.v1.attention.backends.registry import (
         AttentionBackendEnum,
         register_backend,
@@ -63,7 +56,6 @@ def patch_attention_backend() -> None:
 
 
 def patch_sampler() -> None:
-    """Replace Sampler.compute_logprobs with the deterministic log-softmax."""
     from vllm.v1.sample.sampler import Sampler
 
     from .sampling import deterministic_log_softmax
