@@ -12,6 +12,7 @@ class DeterministicRMSNorm(RMSNorm):
         super().__init__(*args, **kwargs)
         cfg = get_runtime_config()
         self._fxp_int_bits = cfg.fxp_int_bits
+        self._fxp_frac_bits = cfg.fxp_frac_bits
 
     def forward_cuda(
         self,
@@ -26,6 +27,7 @@ class DeterministicRMSNorm(RMSNorm):
                 self.weight,
                 self.variance_epsilon,
                 self._fxp_int_bits,
+                self._fxp_frac_bits,
             )
             return out, residual
 
@@ -34,4 +36,5 @@ class DeterministicRMSNorm(RMSNorm):
             self.weight,
             self.variance_epsilon,
             self._fxp_int_bits,
+            self._fxp_frac_bits,
         )

@@ -66,7 +66,9 @@ class FixedPointConfig(QuantizationConfig):
 class FixedPointLinearMethod(QuantizeMethodBase):
     def __init__(self, config: FixedPointConfig) -> None:
         self.config = config
-        self.fxp_int_bits = get_runtime_config().fxp_int_bits
+        cfg = get_runtime_config()
+        self.fxp_int_bits = cfg.fxp_int_bits
+        self.fxp_frac_bits = cfg.fxp_frac_bits
 
     def create_weights(
         self,
@@ -109,4 +111,6 @@ class FixedPointLinearMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return gemm_fxp(x, layer.weight_native, bias, self.fxp_int_bits)
+        return gemm_fxp(
+            x, layer.weight_native, bias, self.fxp_int_bits, self.fxp_frac_bits
+        )
