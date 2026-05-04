@@ -3,7 +3,7 @@
 Drop-in plugin that makes vLLM's reductions bitwise reproducible. The trick is
 boring: cast to a signed fixed-point integer up front, do the reduction in
 integer space, cast back. Integer addition is associative, so it doesn't matter
-how the work gets sliced across SMs, warps, or KV splits — you get the same
+how the work gets sliced across SMs, warps, or KV splits, you get the same
 bits every time.
 
 All the kernels are hand-written CUDA in [csrc/](csrc/). No Triton, no

@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Callable
 
 from .config import get_runtime_config
@@ -13,7 +14,13 @@ _registered = False
 
 
 def register() -> None:
+    # No-op when FXPR_DISABLE_PATCHES=1. Lets us build a vanilla baseline LLM
+    # in the same process; vLLM otherwise auto-runs this from the
+    # vllm.general_plugins entry point on every construction.
     global _registered
+    if os.environ.get("FXPR_DISABLE_PATCHES") == "1":
+        logger.info("fxpr_vllm: FXPR_DISABLE_PATCHES=1 set; skipping registration")
+        return
     if _registered:
         return
     _registered = True
