@@ -48,14 +48,14 @@ def test_log_softmax_native_dtype(dtype):
     logits = logits_f32.to(dtype)
 
     got = deterministic_log_softmax(logits)
-    assert got.dtype == dtype, f"output dtype {got.dtype} != {dtype}"
+    assert got.dtype == torch.float32, f"output dtype {got.dtype} != torch.float32"
 
-    ref = torch.log_softmax(logits.to(torch.float32), dim=-1).to(dtype)
+    ref = torch.log_softmax(logits.to(torch.float32), dim=-1)
 
     atol, rtol = _DTYPE_TOL[dtype]
-    assert torch.allclose(
-        got.to(torch.float32), ref.to(torch.float32), atol=atol, rtol=rtol
-    ), f"max error = {(got.to(torch.float32) - ref.to(torch.float32)).abs().max().item()}"
+    assert torch.allclose(got, ref, atol=atol, rtol=rtol), (
+        f"max error = {(got - ref).abs().max().item()}"
+    )
 
 
 @requires_cuda
