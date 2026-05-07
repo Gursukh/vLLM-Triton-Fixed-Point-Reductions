@@ -23,7 +23,7 @@ _FRAC_BITS = 16
 def _build_cast_f2i(shape, cfg):
     n = shape["numel"]
     ib = cfg["int_bits"]
-    x = torch.randn(n, device="cuda", dtype=torch.float32)
+    x = torch.randn(n, device="cuda", dtype=torch.float16)
 
     def fn():
         return torch.ops.fxpr.float_to_fixed(x, ib, _FRAC_BITS)
@@ -47,8 +47,8 @@ def _build_cast_i2f(shape, cfg):
 def _build_rms_norm(shape, cfg):
     N, Hd = shape["N"], shape["H"]
     ib = cfg["int_bits"]
-    x = torch.randn(N, Hd, device="cuda", dtype=torch.float32)
-    w = torch.randn(Hd, device="cuda", dtype=torch.float32)
+    x = torch.randn(N, Hd, device="cuda", dtype=torch.float16)
+    w = torch.randn(Hd, device="cuda", dtype=torch.float16)
 
     def fn():
         return torch.ops.fxpr.rms_norm_fxp(x, w, 1e-5, ib, _FRAC_BITS)
@@ -59,9 +59,9 @@ def _build_rms_norm(shape, cfg):
 def _build_rms_norm_residual(shape, cfg):
     N, Hd = shape["N"], shape["H"]
     ib = cfg["int_bits"]
-    x = torch.randn(N, Hd, device="cuda", dtype=torch.float32)
-    w = torch.randn(Hd, device="cuda", dtype=torch.float32)
-    res_init = torch.randn(N, Hd, device="cuda", dtype=torch.float32)
+    x = torch.randn(N, Hd, device="cuda", dtype=torch.float16)
+    w = torch.randn(Hd, device="cuda", dtype=torch.float16)
+    res_init = torch.randn(N, Hd, device="cuda", dtype=torch.float16)
     res = res_init.clone()
 
     # res is mutated in place; reset every call.
@@ -75,7 +75,7 @@ def _build_rms_norm_residual(shape, cfg):
 def _build_log_softmax(shape, cfg):
     N, V = shape["N"], shape["V"]
     ib = cfg["int_bits"]
-    x = torch.randn(N, V, device="cuda", dtype=torch.float32)
+    x = torch.randn(N, V, device="cuda", dtype=torch.float16)
 
     def fn():
         return torch.ops.fxpr.log_softmax_fxp(x, ib, _FRAC_BITS)
@@ -86,9 +86,9 @@ def _build_log_softmax(shape, cfg):
 def _build_gemm(shape, cfg):
     M, N, K = shape["M"], shape["N"], shape["K"]
     ib = cfg["int_bits"]
-    a = torch.randn(M, K, device="cuda", dtype=torch.float32)
-    b = torch.randn(K, N, device="cuda", dtype=torch.float32)
-    bias = torch.randn(N, device="cuda", dtype=torch.float32)
+    a = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    b = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    bias = torch.randn(N, device="cuda", dtype=torch.float16)
 
     def fn():
         return torch.ops.fxpr.gemm_fxp(a, b, bias, ib, _FRAC_BITS)
@@ -114,7 +114,7 @@ def _build_attn(shape, cfg):
     q = torch.randn(q_t, heads, head_dim, device="cuda", dtype=dtype) * 0.02
     kv_cache = torch.randn(num_blocks, 2, page_size, kv_heads, head_dim,
                            device="cuda", dtype=dtype) * 0.02
-    o = torch.zeros(q_t, heads, head_dim, device="cuda", dtype=torch.dtype)
+    o = torch.zeros(q_t, heads, head_dim, device="cuda", dtype=dtype)
     qsl = torch.tensor([0, q_t], dtype=torch.int32, device="cuda")
     sl = torch.tensor([ctx], dtype=torch.int32, device="cuda")
     bt = torch.arange(num_blocks_needed, dtype=torch.int32,
