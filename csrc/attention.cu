@@ -359,6 +359,274 @@ __global__ void attn_split_dv_kernel(
   }
 }
 
+// Q-tile kernels: one CTA covers kQTile queries, one warp per query. Reduction
+// is warp-only (each lane gets head_dim/32 d's). K/V lines hit L1 once and get
+// reused across warps. Bit-exact vs the per-query kernel — same fxp adds.
+
+constexpr int kQTile = 8;
+constexpr int kDPerLaneMax = 8;  // head_dim up to 256
+
+template <typename FxpInt, typename IOFloat, int kFracBits>
+__global__ void attn_split_max_qtile_kernel(
+    const IOFloat* __restrict__ Q,
+    const IOFloat* __restrict__ K_cache,
+    float*         __restrict__ partial_max,
+    const int*   __restrict__ query_start_loc,
+    const int*   __restrict__ seq_lens,
+    const int*   __restrict__ block_table,
+    const float* __restrict__ alibi_slopes,
+    int   num_heads,
+    int   num_kv_heads,
+    int   head_dim,
+    int   page_size,
+    int   num_splits,
+    int64_t stride_q_token,
+    int64_t stride_q_head,
+    int64_t stride_k_block,
+    int64_t stride_k_slot,
+    int64_t stride_k_head,
+    int64_t stride_pmax_token,
+    int64_t stride_pmax_head,
+    int64_t stride_pmax_split,
+    int64_t stride_block_table_row,
+    float softmax_scale_log2,
+    float logit_softcap,
+    int   window_size,
+    bool  is_causal) {
+  const int request_index = blockIdx.x;
+  const int q_block       = blockIdx.y;
+  const int hs            = blockIdx.z;
+  const int head_index    = hs / num_splits;
+  const int split_index   = hs % num_splits;
+  const int kv_head_index = head_index / (num_heads / num_kv_heads);
+
+  const int q_start = query_start_loc[request_index];
+  const int q_end   = query_start_loc[request_index + 1];
+  const int q_len   = q_end - q_start;
+
+  const int tid     = threadIdx.x;
+  const int warp_id = tid / kWarpSize;
+  const int lane    = tid & (kWarpSize - 1);
+  const int q_in_request = q_block * kQTile + warp_id;
+  if (q_in_request >= q_len) return;
+
+  const int seq_len     = seq_lens[request_index];
+  const int context_len = seq_len - q_len;
+  const int q_token_idx = q_start + q_in_request;
+  const int q_abs_pos   = context_len + q_in_request;
+
+  const int key_end   = is_causal ? (q_abs_pos + 1) : seq_len;
+  const int key_start = window_size > 0 ? max(0, q_abs_pos - window_size + 1) : 0;
+
+  int chunk_start, chunk_end;
+  compute_chunk(key_start, key_end, num_splits, split_index,
+                &chunk_start, &chunk_end);
+
+  // partial_max was host-init to -INF, so empty chunks need no write.
+  if (chunk_start >= chunk_end) return;
+
+  const int D_PER_LANE = head_dim / kWarpSize;
+  const float alibi_slope =
+      alibi_slopes != nullptr ? alibi_slopes[head_index] : 0.0f;
+
+  // Lane l holds Q[l*D_PER_LANE : (l+1)*D_PER_LANE] in registers.
+  float q_reg[kDPerLaneMax];
+  const IOFloat* q_row =
+      Q + q_token_idx * stride_q_token + head_index * stride_q_head;
+  #pragma unroll
+  for (int e = 0; e < kDPerLaneMax; ++e) {
+    if (e < D_PER_LANE) {
+      q_reg[e] = static_cast<float>(q_row[lane * D_PER_LANE + e]);
+    }
+  }
+
+  const int* bt_row = block_table + request_index * stride_block_table_row;
+
+  float row_max = -INFINITY;
+  for (int kp = chunk_start; kp < chunk_end; ++kp) {
+    const IOFloat* k_row = paged_kv_row<IOFloat>(
+        K_cache, bt_row, kp, page_size, kv_head_index,
+        stride_k_block, stride_k_slot, stride_k_head);
+
+    FxpInt partial = 0;
+    #pragma unroll
+    for (int e = 0; e < kDPerLaneMax; ++e) {
+      if (e < D_PER_LANE) {
+        const float kd = static_cast<float>(k_row[lane * D_PER_LANE + e]);
+        partial += float_to_fixed<FxpInt, kFracBits>(q_reg[e] * kd);
+      }
+    }
+    partial = warp_reduce_sum<FxpInt>(partial);
+
+    const float qk = post_process_qk<FxpInt, kFracBits>(
+        partial, softmax_scale_log2, logit_softcap,
+        alibi_slope, kp, q_abs_pos);
+    row_max = fmaxf(row_max, qk);
+  }
+
+  if (lane == 0) {
+    partial_max[q_token_idx * stride_pmax_token
+                + head_index * stride_pmax_head
+                + split_index * stride_pmax_split] = row_max;
+  }
+}
+
+template <typename FxpInt, typename IOFloat, int kFracBits>
+__global__ void attn_split_dv_qtile_kernel(
+    const IOFloat* __restrict__ Q,
+    const IOFloat* __restrict__ K_cache,
+    const IOFloat* __restrict__ V_cache,
+    const float*   __restrict__ partial_max,
+    FxpInt*        __restrict__ partial_denom,
+    FxpInt*        __restrict__ partial_wv,
+    const int*   __restrict__ query_start_loc,
+    const int*   __restrict__ seq_lens,
+    const int*   __restrict__ block_table,
+    const float* __restrict__ alibi_slopes,
+    int   num_heads,
+    int   num_kv_heads,
+    int   head_dim,
+    int   page_size,
+    int   num_splits,
+    int64_t stride_q_token,
+    int64_t stride_q_head,
+    int64_t stride_k_block,
+    int64_t stride_k_slot,
+    int64_t stride_k_head,
+    int64_t stride_v_block,
+    int64_t stride_v_slot,
+    int64_t stride_v_head,
+    int64_t stride_pmax_token,
+    int64_t stride_pmax_head,
+    int64_t stride_pmax_split,
+    int64_t stride_pdenom_token,
+    int64_t stride_pdenom_head,
+    int64_t stride_pdenom_split,
+    int64_t stride_pwv_token,
+    int64_t stride_pwv_head,
+    int64_t stride_pwv_split,
+    int64_t stride_pwv_d,
+    int64_t stride_block_table_row,
+    float softmax_scale_log2,
+    float logit_softcap,
+    int   window_size,
+    bool  is_causal) {
+  const int request_index = blockIdx.x;
+  const int q_block       = blockIdx.y;
+  const int hs            = blockIdx.z;
+  const int head_index    = hs / num_splits;
+  const int split_index   = hs % num_splits;
+  const int kv_head_index = head_index / (num_heads / num_kv_heads);
+
+  const int q_start = query_start_loc[request_index];
+  const int q_end   = query_start_loc[request_index + 1];
+  const int q_len   = q_end - q_start;
+
+  const int tid     = threadIdx.x;
+  const int warp_id = tid / kWarpSize;
+  const int lane    = tid & (kWarpSize - 1);
+  const int q_in_request = q_block * kQTile + warp_id;
+  if (q_in_request >= q_len) return;
+
+  const int seq_len     = seq_lens[request_index];
+  const int context_len = seq_len - q_len;
+  const int q_token_idx = q_start + q_in_request;
+  const int q_abs_pos   = context_len + q_in_request;
+
+  const int key_end   = is_causal ? (q_abs_pos + 1) : seq_len;
+  const int key_start = window_size > 0 ? max(0, q_abs_pos - window_size + 1) : 0;
+
+  int chunk_start, chunk_end;
+  compute_chunk(key_start, key_end, num_splits, split_index,
+                &chunk_start, &chunk_end);
+
+  if (chunk_start >= chunk_end) return;
+
+  const int D_PER_LANE = head_dim / kWarpSize;
+  const float alibi_slope =
+      alibi_slopes != nullptr ? alibi_slopes[head_index] : 0.0f;
+
+  // Global max across this query's splits.
+  float global_max = -INFINITY;
+  const float* pm_row = partial_max
+      + q_token_idx * stride_pmax_token
+      + head_index * stride_pmax_head;
+  #pragma unroll 4
+  for (int s = 0; s < num_splits; ++s) {
+    global_max = fmaxf(global_max, pm_row[s * stride_pmax_split]);
+  }
+
+  float q_reg[kDPerLaneMax];
+  const IOFloat* q_row =
+      Q + q_token_idx * stride_q_token + head_index * stride_q_head;
+  #pragma unroll
+  for (int e = 0; e < kDPerLaneMax; ++e) {
+    if (e < D_PER_LANE) {
+      q_reg[e] = static_cast<float>(q_row[lane * D_PER_LANE + e]);
+    }
+  }
+
+  FxpInt out_acc[kDPerLaneMax];
+  #pragma unroll
+  for (int e = 0; e < kDPerLaneMax; ++e) out_acc[e] = 0;
+  FxpInt denom_partial = 0;
+
+  const int* bt_row = block_table + request_index * stride_block_table_row;
+
+  for (int kp = chunk_start; kp < chunk_end; ++kp) {
+    const IOFloat* k_row = paged_kv_row<IOFloat>(
+        K_cache, bt_row, kp, page_size, kv_head_index,
+        stride_k_block, stride_k_slot, stride_k_head);
+    const IOFloat* v_row = paged_kv_row<IOFloat>(
+        V_cache, bt_row, kp, page_size, kv_head_index,
+        stride_v_block, stride_v_slot, stride_v_head);
+
+    FxpInt qk_fxp = 0;
+    #pragma unroll
+    for (int e = 0; e < kDPerLaneMax; ++e) {
+      if (e < D_PER_LANE) {
+        const float kd = static_cast<float>(k_row[lane * D_PER_LANE + e]);
+        qk_fxp += float_to_fixed<FxpInt, kFracBits>(q_reg[e] * kd);
+      }
+    }
+    qk_fxp = warp_reduce_sum<FxpInt>(qk_fxp);
+
+    const float qk = post_process_qk<FxpInt, kFracBits>(
+        qk_fxp, softmax_scale_log2, logit_softcap,
+        alibi_slope, kp, q_abs_pos);
+    const float weight = exp2f(qk - global_max);
+    const FxpInt weight_fxp = float_to_fixed<FxpInt, kFracBits>(weight);
+
+    if (lane == 0) denom_partial += weight_fxp;
+
+    #pragma unroll
+    for (int e = 0; e < kDPerLaneMax; ++e) {
+      if (e < D_PER_LANE) {
+        const float vd =
+            static_cast<float>(v_row[lane * D_PER_LANE + e]);
+        out_acc[e] += float_to_fixed<FxpInt, kFracBits>(weight * vd);
+      }
+    }
+  }
+
+  if (lane == 0) {
+    partial_denom[q_token_idx * stride_pdenom_token
+                  + head_index * stride_pdenom_head
+                  + split_index * stride_pdenom_split] = denom_partial;
+  }
+
+  FxpInt* pwv_row = partial_wv
+      + q_token_idx * stride_pwv_token
+      + head_index * stride_pwv_head
+      + split_index * stride_pwv_split;
+  #pragma unroll
+  for (int e = 0; e < kDPerLaneMax; ++e) {
+    if (e < D_PER_LANE) {
+      pwv_row[(lane * D_PER_LANE + e) * stride_pwv_d] = out_acc[e];
+    }
+  }
+}
+
 template <typename FxpInt, typename IOFloat, int kFracBits>
 __global__ void attn_combine_kernel(
     const FxpInt* __restrict__ partial_denom,    // (T, H, S)
@@ -488,54 +756,112 @@ void launch_attention_typed(
 
   const size_t dyn_smem_bytes = head_dim * sizeof(IOFloat);
 
-  dim3 grid_split(num_requests, max_query_len, num_heads * effective_splits);
-  dim3 grid_combine(num_requests, max_query_len, num_heads);
+  // Q-tile path packs kQTile queries per CTA. Needs head_dim to fit the
+  // per-lane register budget and at least one full tile of queries.
+  const bool use_qtile = (max_query_len >= kQTile)
+                       && (head_dim % kWarpSize == 0)
+                       && (head_dim <= kWarpSize * kDPerLaneMax);
 
+  dim3 grid_combine(num_requests, max_query_len, num_heads);
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  attn_split_max_kernel<FxpInt, IOFloat, kFracBits><<<grid_split, threads, dyn_smem_bytes, stream>>>(
-      q.data_ptr<IOFloat>(),
-      k_cache.data_ptr<IOFloat>(),
-      partial_max.data_ptr<float>(),
-      query_start_loc.data_ptr<int>(),
-      seq_lens.data_ptr<int>(),
-      block_table.data_ptr<int>(),
-      alibi_slopes ? alibi_slopes->data_ptr<float>() : nullptr,
-      num_heads, num_kv_heads, head_dim, page_size, effective_splits,
-      q.stride(0), q.stride(1),
-      k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-      partial_max.stride(0), partial_max.stride(1), partial_max.stride(2),
-      block_table.stride(0),
-      softmax_scale_log2,
-      logit_softcap,
-      window_size,
-      is_causal);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (use_qtile) {
+    const int q_blocks = (max_query_len + kQTile - 1) / kQTile;
+    dim3 grid_split(num_requests, q_blocks, num_heads * effective_splits);
+    const int qtile_threads = kWarpSize * kQTile;
 
-  attn_split_dv_kernel<FxpInt, IOFloat, kFracBits><<<grid_split, threads, dyn_smem_bytes, stream>>>(
-      q.data_ptr<IOFloat>(),
-      k_cache.data_ptr<IOFloat>(),
-      v_cache.data_ptr<IOFloat>(),
-      partial_max.data_ptr<float>(),
-      partial_denom.template data_ptr<FxpInt>(),
-      partial_wv.template data_ptr<FxpInt>(),
-      query_start_loc.data_ptr<int>(),
-      seq_lens.data_ptr<int>(),
-      block_table.data_ptr<int>(),
-      alibi_slopes ? alibi_slopes->data_ptr<float>() : nullptr,
-      num_heads, num_kv_heads, head_dim, page_size, effective_splits,
-      q.stride(0), q.stride(1),
-      k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-      v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-      partial_max.stride(0), partial_max.stride(1), partial_max.stride(2),
-      partial_denom.stride(0), partial_denom.stride(1), partial_denom.stride(2),
-      partial_wv.stride(0), partial_wv.stride(1), partial_wv.stride(2), partial_wv.stride(3),
-      block_table.stride(0),
-      softmax_scale_log2,
-      logit_softcap,
-      window_size,
-      is_causal);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+    attn_split_max_qtile_kernel<FxpInt, IOFloat, kFracBits>
+        <<<grid_split, qtile_threads, 0, stream>>>(
+        q.data_ptr<IOFloat>(),
+        k_cache.data_ptr<IOFloat>(),
+        partial_max.data_ptr<float>(),
+        query_start_loc.data_ptr<int>(),
+        seq_lens.data_ptr<int>(),
+        block_table.data_ptr<int>(),
+        alibi_slopes ? alibi_slopes->data_ptr<float>() : nullptr,
+        num_heads, num_kv_heads, head_dim, page_size, effective_splits,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        partial_max.stride(0), partial_max.stride(1), partial_max.stride(2),
+        block_table.stride(0),
+        softmax_scale_log2,
+        logit_softcap,
+        window_size,
+        is_causal);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    attn_split_dv_qtile_kernel<FxpInt, IOFloat, kFracBits>
+        <<<grid_split, qtile_threads, 0, stream>>>(
+        q.data_ptr<IOFloat>(),
+        k_cache.data_ptr<IOFloat>(),
+        v_cache.data_ptr<IOFloat>(),
+        partial_max.data_ptr<float>(),
+        partial_denom.template data_ptr<FxpInt>(),
+        partial_wv.template data_ptr<FxpInt>(),
+        query_start_loc.data_ptr<int>(),
+        seq_lens.data_ptr<int>(),
+        block_table.data_ptr<int>(),
+        alibi_slopes ? alibi_slopes->data_ptr<float>() : nullptr,
+        num_heads, num_kv_heads, head_dim, page_size, effective_splits,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        partial_max.stride(0), partial_max.stride(1), partial_max.stride(2),
+        partial_denom.stride(0), partial_denom.stride(1), partial_denom.stride(2),
+        partial_wv.stride(0), partial_wv.stride(1), partial_wv.stride(2), partial_wv.stride(3),
+        block_table.stride(0),
+        softmax_scale_log2,
+        logit_softcap,
+        window_size,
+        is_causal);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  } else {
+    dim3 grid_split(num_requests, max_query_len, num_heads * effective_splits);
+
+    attn_split_max_kernel<FxpInt, IOFloat, kFracBits><<<grid_split, threads, dyn_smem_bytes, stream>>>(
+        q.data_ptr<IOFloat>(),
+        k_cache.data_ptr<IOFloat>(),
+        partial_max.data_ptr<float>(),
+        query_start_loc.data_ptr<int>(),
+        seq_lens.data_ptr<int>(),
+        block_table.data_ptr<int>(),
+        alibi_slopes ? alibi_slopes->data_ptr<float>() : nullptr,
+        num_heads, num_kv_heads, head_dim, page_size, effective_splits,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        partial_max.stride(0), partial_max.stride(1), partial_max.stride(2),
+        block_table.stride(0),
+        softmax_scale_log2,
+        logit_softcap,
+        window_size,
+        is_causal);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    attn_split_dv_kernel<FxpInt, IOFloat, kFracBits><<<grid_split, threads, dyn_smem_bytes, stream>>>(
+        q.data_ptr<IOFloat>(),
+        k_cache.data_ptr<IOFloat>(),
+        v_cache.data_ptr<IOFloat>(),
+        partial_max.data_ptr<float>(),
+        partial_denom.template data_ptr<FxpInt>(),
+        partial_wv.template data_ptr<FxpInt>(),
+        query_start_loc.data_ptr<int>(),
+        seq_lens.data_ptr<int>(),
+        block_table.data_ptr<int>(),
+        alibi_slopes ? alibi_slopes->data_ptr<float>() : nullptr,
+        num_heads, num_kv_heads, head_dim, page_size, effective_splits,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        partial_max.stride(0), partial_max.stride(1), partial_max.stride(2),
+        partial_denom.stride(0), partial_denom.stride(1), partial_denom.stride(2),
+        partial_wv.stride(0), partial_wv.stride(1), partial_wv.stride(2), partial_wv.stride(3),
+        block_table.stride(0),
+        softmax_scale_log2,
+        logit_softcap,
+        window_size,
+        is_causal);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 
   int combine_threads = 32;
   while (combine_threads < head_dim && combine_threads < kMaxThreads) combine_threads <<= 1;

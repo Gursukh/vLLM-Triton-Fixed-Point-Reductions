@@ -30,16 +30,24 @@ namespace fxpr
     {
 
       // ----- Block / warp / fragment layout -------------------------------------
+      // Two tilings; pick at launch based on grid size. K-order per output is
+      // identical between them, so outputs are bit-exact either way.
 
-      constexpr int kBM = 128;
-      constexpr int kBN = 128;
-      constexpr int kWarpsM = 4;
-      constexpr int kWarpsN = 2;
-      constexpr int kWarps = kWarpsM * kWarpsN; // 8
-      constexpr int kThreads = kWarps * 32;     // 256
+      template <int BM_, int BN_, int WarpsM_, int WarpsN_>
+      struct GemmTile
+      {
+        static constexpr int BM = BM_;
+        static constexpr int BN = BN_;
+        static constexpr int WarpsM = WarpsM_;
+        static constexpr int WarpsN = WarpsN_;
+        static constexpr int Warps = WarpsM * WarpsN;
+        static constexpr int Threads = Warps * 32;
+        static constexpr int WarpM = BM / WarpsM;
+        static constexpr int WarpN = BN / WarpsN;
+      };
 
-      constexpr int kWarpM = kBM / kWarpsM; // 32
-      constexpr int kWarpN = kBN / kWarpsN; // 64
+      using TileBig   = GemmTile<128, 128, 4, 2>;  // 8 warps
+      using TileSmall = GemmTile<64,  128, 2, 2>;  // 4 warps, doubles M-grid
 
       // K-tile width per dtype. Picked to fit double-buffered smem in 48KB.
       template <typename T>
@@ -98,9 +106,6 @@ namespace fxpr
       };
 #endif
 
-      constexpr int kFragsM = kWarpM / 16; // 2
-      constexpr int kFragsN = kWarpN / 16; // 4
-
       // 8 elements per thread for the m16n16 fragments.
       constexpr int kFragElems = 8;
 
@@ -148,13 +153,15 @@ namespace fxpr
       // 128-bit vectorised load when the layout/alignment allows it, scalar
       // fallback otherwise. Tails zero-fill so non-multiple K just works.
 
-      template <typename T, int BK>
+      template <typename Tile, typename T, int BK>
       __device__ __forceinline__ void load_a_to_smem(
           T (*A_smem)[BK],
           const T *__restrict__ a, int M, int K,
           int64_t stride_am, int64_t stride_ak,
           int m_block, int k_block, int tid)
       {
+        constexpr int kBM = Tile::BM;
+        constexpr int kThreads = Tile::Threads;
         constexpr int kBytesPerVec = 16;
         constexpr int kElemsPerVec = kBytesPerVec / sizeof(T);
         constexpr int kVecsPerThread =
@@ -196,13 +203,15 @@ namespace fxpr
         }
       }
 
-      template <typename T, int BK>
+      template <typename Tile, typename T, int BK>
       __device__ __forceinline__ void load_b_to_smem(
-          T (*B_smem)[kBN],
+          T (*B_smem)[Tile::BN],
           const T *__restrict__ b, int K, int N,
           int64_t stride_bk, int64_t stride_bn,
           int k_block, int n_block, int tid)
       {
+        constexpr int kBN = Tile::BN;
+        constexpr int kThreads = Tile::Threads;
         constexpr int kBytesPerVec = 16;
         constexpr int kElemsPerVec = kBytesPerVec / sizeof(T);
         constexpr int kVecsPerThread =
@@ -247,7 +256,7 @@ namespace fxpr
       // Body is templated on (FxpInt, IOFloat). The sm_75 path discards the
       // bf16/TF32 branches via `if constexpr` so they're never instantiated.
 
-      template <typename FxpInt, typename IOFloat, int kFracBits>
+      template <typename Tile, typename FxpInt, typename IOFloat, int kFracBits>
       __device__ void gemm_body(
           const IOFloat *__restrict__ a,
           const IOFloat *__restrict__ b,
@@ -266,6 +275,15 @@ namespace fxpr
         constexpr int kBK = BKConfig<IOFloat>::value; // 32 (half/bf16) or 16 (float)
         constexpr int K_ITERS = kBK / FK;
 
+        constexpr int kBM = Tile::BM;
+        constexpr int kBN = Tile::BN;
+        constexpr int kWarpsN = Tile::WarpsN;
+        constexpr int kWarps = Tile::Warps;
+        constexpr int kWarpM = Tile::WarpM;
+        constexpr int kWarpN = Tile::WarpN;
+        constexpr int kFragsM = kWarpM / 16;
+        constexpr int kFragsN = kWarpN / 16;
+
         // Double-buffered A/B smem so HBM loads overlap mma compute.
         __shared__ __align__(16) IOFloat A_smem[2][kBM][kBK];
         __shared__ __align__(16) IOFloat B_smem[2][kBK][kBN];
@@ -274,8 +292,8 @@ namespace fxpr
         const int tid = threadIdx.x;
         const int warp_id = tid / 32;
         const int lane = tid & 31;
-        const int warp_m = warp_id / kWarpsN; // 0..3
-        const int warp_n = warp_id % kWarpsN; // 0..1
+        const int warp_m = warp_id / kWarpsN;
+        const int warp_n = warp_id % kWarpsN;
         const int m_block = blockIdx.y * kBM;
         const int n_block = blockIdx.x * kBN;
 
@@ -292,9 +310,9 @@ namespace fxpr
 
         if (num_tiles > 0)
         {
-          load_a_to_smem<IOFloat, kBK>(A_smem[0], a, M, K, stride_am, stride_ak,
+          load_a_to_smem<Tile, IOFloat, kBK>(A_smem[0], a, M, K, stride_am, stride_ak,
                                        m_block, 0, tid);
-          load_b_to_smem<IOFloat, kBK>(B_smem[0], b, K, N, stride_bk, stride_bn,
+          load_b_to_smem<Tile, IOFloat, kBK>(B_smem[0], b, K, N, stride_bk, stride_bn,
                                        0, n_block, tid);
         }
         __syncthreads();
@@ -308,9 +326,9 @@ namespace fxpr
           // Prefetch tile it+1 into the inactive buffer.
           if (next_k_block < K)
           {
-            load_a_to_smem<IOFloat, kBK>(A_smem[nxt], a, M, K, stride_am, stride_ak,
+            load_a_to_smem<Tile, IOFloat, kBK>(A_smem[nxt], a, M, K, stride_am, stride_ak,
                                          m_block, next_k_block, tid);
-            load_b_to_smem<IOFloat, kBK>(B_smem[nxt], b, K, N, stride_bk, stride_bn,
+            load_b_to_smem<Tile, IOFloat, kBK>(B_smem[nxt], b, K, N, stride_bk, stride_bn,
                                          next_k_block, n_block, tid);
           }
 
@@ -418,7 +436,7 @@ namespace fxpr
         }
       }
 
-      template <typename FxpInt, typename IOFloat, int kFracBits>
+      template <typename Tile, typename FxpInt, typename IOFloat, int kFracBits>
       __global__ void gemm_kernel_tc(
           const IOFloat *__restrict__ a,
           const IOFloat *__restrict__ b,
@@ -433,7 +451,7 @@ namespace fxpr
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
         if constexpr (kIsFp16)
         {
-          gemm_body<FxpInt, IOFloat, kFracBits>(a, b, bias, c, M, N, K,
+          gemm_body<Tile, FxpInt, IOFloat, kFracBits>(a, b, bias, c, M, N, K,
                                                 stride_am, stride_ak, stride_bk, stride_bn,
                                                 stride_cm, stride_cn);
         }
@@ -443,7 +461,7 @@ namespace fxpr
           __trap();
         }
 #else
-        gemm_body<FxpInt, IOFloat, kFracBits>(a, b, bias, c, M, N, K,
+        gemm_body<Tile, FxpInt, IOFloat, kFracBits>(a, b, bias, c, M, N, K,
                                               stride_am, stride_ak, stride_bk, stride_bn,
                                               stride_cm, stride_cn);
 #endif
@@ -482,6 +500,28 @@ namespace fxpr
         return reinterpret_cast<const IOFloat *>(t.data_ptr<Aten>());
       }
 
+      template <typename Tile, typename FxpInt, typename IOFloat, int kFracBits>
+      void launch_with_tile(
+          const at::Tensor &a, const at::Tensor &b,
+          const IOFloat *bias_ptr, at::Tensor &c,
+          int M, int N, int K)
+      {
+        constexpr int BM = Tile::BM;
+        constexpr int BN = Tile::BN;
+        constexpr int Threads = Tile::Threads;
+        dim3 block(Threads);
+        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+        auto stream = at::cuda::getCurrentCUDAStream();
+        gemm_kernel_tc<Tile, FxpInt, IOFloat, kFracBits><<<grid, block, 0, stream>>>(
+            native_ptr<IOFloat>(a), native_ptr<IOFloat>(b),
+            bias_ptr, native_ptr<IOFloat>(c),
+            M, N, K,
+            a.stride(0), a.stride(1),
+            b.stride(0), b.stride(1),
+            c.stride(0), c.stride(1));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      }
+
       template <typename FxpInt, typename IOFloat, int kFracBits>
       void launch_typed(
           const at::Tensor &a, const at::Tensor &b,
@@ -493,22 +533,25 @@ namespace fxpr
         if (M == 0 || N == 0)
           return;
 
-        dim3 block(kThreads);
-        dim3 grid((N + kBN - 1) / kBN, (M + kBM - 1) / kBM);
-
         const IOFloat *bias_ptr = bias.has_value()
                                       ? native_ptr<IOFloat>(*bias)
                                       : nullptr;
 
-        auto stream = at::cuda::getCurrentCUDAStream();
-        gemm_kernel_tc<FxpInt, IOFloat, kFracBits><<<grid, block, 0, stream>>>(
-            native_ptr<IOFloat>(a), native_ptr<IOFloat>(b),
-            bias_ptr, native_ptr<IOFloat>(c),
-            M, N, K,
-            a.stride(0), a.stride(1),
-            b.stride(0), b.stride(1),
-            c.stride(0), c.stride(1));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        // Drop to the small tile when the big-tile grid wouldn't fill ~2 waves.
+        const auto* props = at::cuda::getCurrentDeviceProperties();
+        const int sm_count = props->multiProcessorCount;
+        const int big_grid_ctas =
+            ((M + TileBig::BM - 1) / TileBig::BM) *
+            ((N + TileBig::BN - 1) / TileBig::BN);
+        const bool use_small_tile = (big_grid_ctas < 2 * sm_count);
+
+        if (use_small_tile) {
+          launch_with_tile<TileSmall, FxpInt, IOFloat, kFracBits>(
+              a, b, bias_ptr, c, M, N, K);
+        } else {
+          launch_with_tile<TileBig, FxpInt, IOFloat, kFracBits>(
+              a, b, bias_ptr, c, M, N, K);
+        }
       }
 
       template <typename FxpInt, int kFracBits>

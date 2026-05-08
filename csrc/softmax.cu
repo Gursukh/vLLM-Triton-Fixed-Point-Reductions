@@ -38,6 +38,52 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
   return v;
 }
 
+// Slice [0, total) into num_splits chunks (matches attention's compute_chunk).
+__device__ __forceinline__ void compute_chunk(
+    int total, int num_splits, int split,
+    int* out_start, int* out_end) {
+  const int64_t lo = (int64_t)split * total;
+  const int64_t hi = (int64_t)(split + 1) * total;
+  *out_start = (int)(lo / num_splits);
+  *out_end = (int)(hi / num_splits);
+}
+
+template <typename FxpInt>
+__device__ __forceinline__ FxpInt block_reduce_sum_fxp(
+    FxpInt v, FxpInt* shmem) {
+  const int tid = threadIdx.x;
+  const int lane = tid & (kWarpSize - 1);
+  const int warp = tid / kWarpSize;
+  const int num_warps = (blockDim.x + kWarpSize - 1) / kWarpSize;
+  v = warp_reduce_sum<FxpInt>(v);
+  if (lane == 0) shmem[warp] = v;
+  __syncthreads();
+  if (warp == 0) {
+    FxpInt x = lane < num_warps ? shmem[lane] : FxpInt(0);
+    x = warp_reduce_sum<FxpInt>(x);
+    if (lane == 0) shmem[0] = x;
+  }
+  __syncthreads();
+  return shmem[0];
+}
+
+__device__ __forceinline__ float block_reduce_max(float v, float* shmem) {
+  const int tid = threadIdx.x;
+  const int lane = tid & (kWarpSize - 1);
+  const int warp = tid / kWarpSize;
+  const int num_warps = (blockDim.x + kWarpSize - 1) / kWarpSize;
+  v = warp_reduce_max(v);
+  if (lane == 0) shmem[warp] = v;
+  __syncthreads();
+  if (warp == 0) {
+    float x = lane < num_warps ? shmem[lane] : -INFINITY;
+    x = warp_reduce_max(x);
+    if (lane == 0) shmem[0] = x;
+  }
+  __syncthreads();
+  return shmem[0];
+}
+
 template <typename FxpInt, typename IOFloat, int kFracBits>
 __global__ void log_softmax_kernel(
     const IOFloat* __restrict__ x,
@@ -108,6 +154,111 @@ __global__ void log_softmax_kernel(
   }
 }
 
+// Split-V variant for small batch / large N (e.g. decode with rows=1). All
+// splits share global_max, and we sum partials in split-index order, so the
+// result is bit-exact vs the single-CTA path.
+
+template <typename IOFloat>
+__global__ void log_softmax_split_max_kernel(
+    const IOFloat* __restrict__ x,
+    float* __restrict__ partial_max,
+    int64_t stride_x, int N, int num_splits) {
+  const int row = blockIdx.x;
+  const int split = blockIdx.y;
+  const int tid = threadIdx.x;
+
+  int chunk_start, chunk_end;
+  compute_chunk(N, num_splits, split, &chunk_start, &chunk_end);
+
+  const IOFloat* x_row = x + row * stride_x;
+  float local = -INFINITY;
+  for (int i = chunk_start + tid; i < chunk_end; i += blockDim.x) {
+    local = fmaxf(local, static_cast<float>(x_row[i]));
+  }
+
+  __shared__ float shm[kMaxThreads / kWarpSize];
+  const float row_split_max = block_reduce_max(local, shm);
+  if (tid == 0) {
+    partial_max[row * num_splits + split] = row_split_max;
+  }
+}
+
+template <typename FxpInt, typename IOFloat, int kFracBits>
+__global__ void log_softmax_split_sum_kernel(
+    const IOFloat* __restrict__ x,
+    const float* __restrict__ partial_max,
+    FxpInt* __restrict__ partial_sum,
+    int64_t stride_x, int N, int num_splits) {
+  const int row = blockIdx.x;
+  const int split = blockIdx.y;
+  const int tid = threadIdx.x;
+
+  __shared__ float s_global_max;
+  if (tid == 0) {
+    float m = -INFINITY;
+    const float* pm = partial_max + row * num_splits;
+    for (int s = 0; s < num_splits; ++s) m = fmaxf(m, pm[s]);
+    s_global_max = m;
+  }
+  __syncthreads();
+  const float global_max = s_global_max;
+
+  int chunk_start, chunk_end;
+  compute_chunk(N, num_splits, split, &chunk_start, &chunk_end);
+
+  const IOFloat* x_row = x + row * stride_x;
+  FxpInt local = 0;
+  for (int i = chunk_start + tid; i < chunk_end; i += blockDim.x) {
+    const float xi = static_cast<float>(x_row[i]);
+    local += float_to_fixed<FxpInt, kFracBits>(expf(xi - global_max));
+  }
+
+  __shared__ FxpInt shm[kMaxThreads / kWarpSize];
+  const FxpInt total_split = block_reduce_sum_fxp<FxpInt>(local, shm);
+  if (tid == 0) {
+    partial_sum[row * num_splits + split] = total_split;
+  }
+}
+
+template <typename FxpInt, typename IOFloat, int kFracBits>
+__global__ void log_softmax_split_writeback_kernel(
+    const IOFloat* __restrict__ x,
+    IOFloat* __restrict__ y,
+    const float* __restrict__ partial_max,
+    const FxpInt* __restrict__ partial_sum,
+    int64_t stride_x, int64_t stride_y,
+    int N, int num_splits) {
+  const int row = blockIdx.x;
+  const int split = blockIdx.y;
+  const int tid = threadIdx.x;
+
+  __shared__ float s_global_max;
+  __shared__ float s_log_sum;
+  if (tid == 0) {
+    float m = -INFINITY;
+    const float* pm = partial_max + row * num_splits;
+    for (int s = 0; s < num_splits; ++s) m = fmaxf(m, pm[s]);
+    FxpInt total = 0;
+    const FxpInt* ps = partial_sum + row * num_splits;
+    for (int s = 0; s < num_splits; ++s) total += ps[s];
+    s_global_max = m;
+    s_log_sum = logf(fixed_to_float<FxpInt, kFracBits>(total));
+  }
+  __syncthreads();
+  const float global_max = s_global_max;
+  const float log_sum = s_log_sum;
+
+  int chunk_start, chunk_end;
+  compute_chunk(N, num_splits, split, &chunk_start, &chunk_end);
+
+  const IOFloat* x_row = x + row * stride_x;
+  IOFloat* y_row = y + row * stride_y;
+  for (int i = chunk_start + tid; i < chunk_end; i += blockDim.x) {
+    const float xi = static_cast<float>(x_row[i]);
+    y_row[i] = static_cast<IOFloat>((xi - global_max) - log_sum);
+  }
+}
+
 template <typename FxpInt, typename IOFloat, int kFracBits>
 void launch_typed(
     const at::Tensor& x_2d,
@@ -116,17 +267,70 @@ void launch_typed(
   const int N = x_2d.size(1);
   if (rows == 0 || N == 0) return;
 
-  int block = 1;
-  while (block < N && block < kMaxThreads) block <<= 1;
-  if (block > kMaxThreads) block = kMaxThreads;
-
   auto stream = at::cuda::getCurrentCUDAStream();
-  log_softmax_kernel<FxpInt, IOFloat, kFracBits><<<rows, block, 0, stream>>>(
+
+  // Split V only when rows wouldn't fill the SMs and N is big enough to pay
+  // for the extra launches. Capped at 16 splits.
+  const auto* props = at::cuda::getCurrentDeviceProperties();
+  const int sm_count = props->multiProcessorCount;
+  int num_splits = 1;
+  if (rows < sm_count && N >= 4096) {
+    num_splits = std::min(16, std::max(1, sm_count / std::max(1, rows)));
+    if (num_splits < 2) num_splits = 1;
+  }
+
+  if (num_splits == 1) {
+    int block = 1;
+    while (block < N && block < kMaxThreads) block <<= 1;
+    if (block > kMaxThreads) block = kMaxThreads;
+
+    log_softmax_kernel<FxpInt, IOFloat, kFracBits><<<rows, block, 0, stream>>>(
+        x_2d.data_ptr<IOFloat>(),
+        y_2d.data_ptr<IOFloat>(),
+        x_2d.stride(0),
+        y_2d.stride(0),
+        N);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+
+  const int max_chunk = (N + num_splits - 1) / num_splits;
+  int block = 1;
+  while (block < max_chunk && block < kMaxThreads) block <<= 1;
+  if (block > kMaxThreads) block = kMaxThreads;
+  if (block < kWarpSize) block = kWarpSize;
+
+  const auto fxp_dtype = c10::CppTypeToScalarType<FxpInt>::value;
+  auto partial_max = at::full(
+      {rows, num_splits},
+      -std::numeric_limits<float>::infinity(),
+      x_2d.options().dtype(at::kFloat));
+  auto partial_sum = at::zeros(
+      {rows, num_splits}, x_2d.options().dtype(fxp_dtype));
+
+  dim3 grid(rows, num_splits);
+
+  log_softmax_split_max_kernel<IOFloat><<<grid, block, 0, stream>>>(
+      x_2d.data_ptr<IOFloat>(),
+      partial_max.data_ptr<float>(),
+      x_2d.stride(0), N, num_splits);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  log_softmax_split_sum_kernel<FxpInt, IOFloat, kFracBits>
+      <<<grid, block, 0, stream>>>(
+      x_2d.data_ptr<IOFloat>(),
+      partial_max.data_ptr<float>(),
+      partial_sum.template data_ptr<FxpInt>(),
+      x_2d.stride(0), N, num_splits);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  log_softmax_split_writeback_kernel<FxpInt, IOFloat, kFracBits>
+      <<<grid, block, 0, stream>>>(
       x_2d.data_ptr<IOFloat>(),
       y_2d.data_ptr<IOFloat>(),
-      x_2d.stride(0),
-      y_2d.stride(0),
-      N);
+      partial_max.data_ptr<float>(),
+      partial_sum.template data_ptr<FxpInt>(),
+      x_2d.stride(0), y_2d.stride(0), N, num_splits);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

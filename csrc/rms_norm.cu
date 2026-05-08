@@ -31,6 +31,27 @@ __device__ __forceinline__ FxpInt warp_reduce_sum(FxpInt v) {
   return v;
 }
 
+// 16B load -> floats. Requires p 16B-aligned and VEC*sizeof(T) == 16.
+template <typename T, int VEC>
+__device__ __forceinline__ void vec_load_to_float(const T* __restrict__ p,
+                                                  float (&out)[VEC]) {
+  const int4 raw = *reinterpret_cast<const int4*>(p);
+  const T* elems = reinterpret_cast<const T*>(&raw);
+  #pragma unroll
+  for (int e = 0; e < VEC; ++e) out[e] = static_cast<float>(elems[e]);
+}
+
+// 16B store of VEC floats downcast to T.
+template <typename T, int VEC>
+__device__ __forceinline__ void vec_store_from_float(T* __restrict__ p,
+                                                     const float (&in)[VEC]) {
+  int4 raw;
+  T* elems = reinterpret_cast<T*>(&raw);
+  #pragma unroll
+  for (int e = 0; e < VEC; ++e) elems[e] = static_cast<T>(in[e]);
+  *reinterpret_cast<int4*>(p) = raw;
+}
+
 template <typename FxpInt, bool kHasResidual, typename IOFloat, int kFracBits>
 __global__ void rms_norm_kernel(
     const IOFloat* __restrict__ x,
@@ -51,17 +72,45 @@ __global__ void rms_norm_kernel(
   extern __shared__ float x_cache[];
   const bool use_cache = (hidden_size <= kSmemCacheElems);
 
+  // Vectorise when hidden_size divides the 16B vec width. Bit-exact: integer
+  // add is associative, only the reduction tree shape changes.
+  constexpr int kVec = 16 / static_cast<int>(sizeof(IOFloat));
+  const bool use_vec = (hidden_size % kVec == 0);
+
   FxpInt partial = 0;
-  for (int i = tid; i < hidden_size; i += nthreads) {
-    float xi = static_cast<float>(x_row[i]);
-    if constexpr (kHasResidual) {
-      const float ri = static_cast<float>(r_row[i]);
-      xi = xi + ri;
-      r_row[i] = static_cast<IOFloat>(xi);
+  if (use_vec) {
+    const int n_vec = hidden_size / kVec;
+    for (int v = tid; v < n_vec; v += nthreads) {
+      const int base = v * kVec;
+      float xv[kVec];
+      vec_load_to_float<IOFloat, kVec>(x_row + base, xv);
+      if constexpr (kHasResidual) {
+        float rv[kVec];
+        vec_load_to_float<IOFloat, kVec>(r_row + base, rv);
+        #pragma unroll
+        for (int e = 0; e < kVec; ++e) xv[e] += rv[e];
+        vec_store_from_float<IOFloat, kVec>(r_row + base, xv);
+      }
+      if (use_cache) {
+        #pragma unroll
+        for (int e = 0; e < kVec; ++e) x_cache[base + e] = xv[e];
+      }
+      #pragma unroll
+      for (int e = 0; e < kVec; ++e) {
+        partial += float_to_fixed<FxpInt, kFracBits>(xv[e] * xv[e]);
+      }
     }
-    if (use_cache) x_cache[i] = xi;
-    const float xi2 = xi * xi;
-    partial += float_to_fixed<FxpInt, kFracBits>(xi2);
+  } else {
+    for (int i = tid; i < hidden_size; i += nthreads) {
+      float xi = static_cast<float>(x_row[i]);
+      if constexpr (kHasResidual) {
+        const float ri = static_cast<float>(r_row[i]);
+        xi = xi + ri;
+        r_row[i] = static_cast<IOFloat>(xi);
+      }
+      if (use_cache) x_cache[i] = xi;
+      partial += float_to_fixed<FxpInt, kFracBits>(xi * xi);
+    }
   }
 
   partial = warp_reduce_sum<FxpInt>(partial);
@@ -91,12 +140,34 @@ __global__ void rms_norm_kernel(
   const float mean_sq = fmaxf(sum_f / static_cast<float>(hidden_size), 0.0f);
   const float rrms = rsqrtf(mean_sq + eps);
 
-  for (int i = tid; i < hidden_size; i += nthreads) {
-    const float xi = use_cache
-        ? x_cache[i]
-        : static_cast<float>(kHasResidual ? r_row[i] : x_row[i]);
-    const float wi = static_cast<float>(w[i]);
-    y_row[i] = static_cast<IOFloat>(xi * wi * rrms);
+  if (use_vec) {
+    const int n_vec = hidden_size / kVec;
+    for (int v = tid; v < n_vec; v += nthreads) {
+      const int base = v * kVec;
+      float wv[kVec];
+      vec_load_to_float<IOFloat, kVec>(w + base, wv);
+      float xv[kVec];
+      if (use_cache) {
+        #pragma unroll
+        for (int e = 0; e < kVec; ++e) xv[e] = x_cache[base + e];
+      } else if constexpr (kHasResidual) {
+        vec_load_to_float<IOFloat, kVec>(r_row + base, xv);
+      } else {
+        vec_load_to_float<IOFloat, kVec>(x_row + base, xv);
+      }
+      float yv[kVec];
+      #pragma unroll
+      for (int e = 0; e < kVec; ++e) yv[e] = xv[e] * wv[e] * rrms;
+      vec_store_from_float<IOFloat, kVec>(y_row + base, yv);
+    }
+  } else {
+    for (int i = tid; i < hidden_size; i += nthreads) {
+      const float xi = use_cache
+          ? x_cache[i]
+          : static_cast<float>(kHasResidual ? r_row[i] : x_row[i]);
+      const float wi = static_cast<float>(w[i]);
+      y_row[i] = static_cast<IOFloat>(xi * wi * rrms);
+    }
   }
 }
 
