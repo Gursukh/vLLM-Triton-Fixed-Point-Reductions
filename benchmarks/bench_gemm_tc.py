@@ -10,7 +10,7 @@ from typing import Iterable
 
 import torch
 
-import fxpr_vllm._cuda  # noqa: F401
+import fxpr_vllm  # noqa: F401
 from tests.fixed_point_helpers import gemm_dtype_supported
 
 

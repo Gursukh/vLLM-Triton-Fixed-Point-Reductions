@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-import fxpr_vllm._cuda  # noqa: F401
+import fxpr_vllm  # noqa: F401
 
 _INT_BITS_BY_DTYPE = {
     torch.int16: 16,

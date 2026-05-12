@@ -6,64 +6,30 @@ integer space, cast back. Integer addition is associative, so it doesn't matter
 how the work gets sliced across SMs, warps, or KV splits, you get the same
 bits every time.
 
-All the kernels are hand-written CUDA in [csrc/](csrc/). No Triton, no
-CUTLASS, no cuBLAS — the whole point is to control every reduction tree.
-Surfaced to Python through `torch.ops.fxpr.*`.
+All the kernels are Triton (`@triton.jit`) in [fxpr_vllm/_triton/](fxpr_vllm/_triton/).
+No C++ build — install is pure Python. Surfaced to Python through `torch.ops.fxpr.*`.
 
 ## What you get
 
 | Op                              | File              |
 | ------------------------------- | ----------------- |
-| `float_to_fixed`/`fixed_to_float` casts | `csrc/casts.cu` |
-| RMSNorm (with fused residual)   | `csrc/rms_norm.cu` |
-| log-softmax                     | `csrc/softmax.cu` |
-| fp32/fp16/bf16 GEMM (tensor cores) | `csrc/gemm.cu` |
-| Unified prefill + decode attention, paged KV | `csrc/attention.cu` |
+| `float_to_fixed`/`fixed_to_float` casts | `fxpr_vllm/_triton/casts.py` |
+| RMSNorm (with fused residual)   | `fxpr_vllm/_triton/rms_norm.py` |
+| log-softmax                     | `fxpr_vllm/_triton/softmax.py` |
+| fp32/fp16/bf16 GEMM (tensor cores) | `fxpr_vllm/_triton/gemm.py` |
+| Unified prefill + decode attention, paged KV | `fxpr_vllm/_triton/attention.py` |
 
 ## Install
 
-### Wheels
-
-Tagged releases ship wheels for the common (Python, torch, CUDA) combinations
-on the [Releases page](https://github.com/Gursukh/Fixed-Point-Reductions-For-vLLM/releases).
-Filenames encode the ABI:
-
-```
-fxpr_vllm-0.1.0-cp312-cp312-linux_x86_64+torch2.6.0cu124.whl
-```
-
-Wheels cover `sm_75` through `sm_90` (Turing → Hopper). Colab example
-(py3.12 / torch 2.6 / CUDA 12.4):
-
 ```bash
-pip install https://github.com/Gursukh/Fixed-Point-Reductions-For-vLLM/releases/download/<TAG>/fxpr_vllm-0.1.0-cp312-cp312-linux_x86_64+torch2.6.0cu124.whl
+pip install git+https://github.com/Gursukh/Fixed-Point-Reductions-For-vLLM.git
 ```
 
-### From source
+No build step, no `TORCH_CUDA_ARCH_LIST`, no `nvcc`. Triton compiles each
+kernel on first call and caches the result.
 
-If nothing matches your env, build it. Your nvcc has to match the CUDA your
-torch was built against — check with:
-
-```bash
-python -c "import torch; print(torch.version.cuda)"
-```
-
-Then:
-
-```bash
-pip install --no-build-isolation git+https://github.com/Gursukh/Fixed-Point-Reductions-For-vLLM.git
-```
-
-`--no-build-isolation` is not optional: pip's isolated build venv would pull a
-fresh torch with a different ABI from the one you'll load at runtime, and the
-extension would fail to import.
-
-Builds are slow because every kernel is instantiated 3 × 3 ways (frac_bits ×
-int_bits). Narrow the arch list and parallelise:
-
-```bash
-TORCH_CUDA_ARCH_LIST=8.9 MAX_JOBS=8 pip install --no-build-isolation .
-```
+Requirements: `torch>=2.6`, `triton>=3.0`, `vllm`. GEMM needs sm_75+ (Turing)
+for fp16; bf16/fp32 inputs need sm_80+ (Ampere).
 
 ## Usage
 
@@ -98,19 +64,16 @@ bump int_bits to 64 if your activations cluster wider.
 ## Layout
 
 ```
-csrc/
-  bindings.cpp        TORCH_LIBRARY registrations (Python-facing schemas)
-  ops.cpp             argument validation
-  ops_internal.h      detail::*_run signatures
-  fixed_point.cuh     templated device-side float <-> fixed helpers
-  casts.cu            float_to_fixed / fixed_to_float
-  rms_norm.cu         RMSNorm + residual variant
-  softmax.cu          log-softmax
-  gemm.cu             tensor-core GEMM with fxp inter-tile accumulation
-  attention.cu        unified prefill + decode, paged KV, split-K
 fxpr_vllm/
-  _cuda               built extension (.so)
-  library_ops.py      Python wrappers + meta/fake impls for Dynamo
+  _lib.py             torch.library schema + CUDA impl registrations
+  _triton/
+    fxp.py            float <-> fixed device helpers (rint, clamp, cast)
+    casts.py          float_to_fixed / fixed_to_float
+    rms_norm.py       RMSNorm + residual variant
+    softmax.py        log-softmax
+    gemm.py           tensor-core GEMM with fxp inter-tile accumulation
+    attention.py      unified prefill + decode, paged KV, split-K
+  library_ops.py      register_fake meta impls for Dynamo
   register.py         vLLM plugin entry point
   monkey_patches.py   the bits vLLM doesn't expose cleanly
   quantisation_config.py

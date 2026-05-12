@@ -1,6 +1,6 @@
 import torch
 
-from . import _cuda  # noqa: F401
+from . import _lib  # noqa: F401
 from .config import get_runtime_config
 
 

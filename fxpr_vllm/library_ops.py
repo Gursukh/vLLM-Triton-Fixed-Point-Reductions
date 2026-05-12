@@ -1,10 +1,8 @@
-""" Wrapper functions for the custom CUDA ops so they can be used in TorchDynamo graph capture. """
+"""Meta (fake) impls for Dynamo + torch.ops.fxpr.* aliases."""
 
 from __future__ import annotations
 
 import torch
-
-from . import _cuda  # noqa: F401
 
 
 def _int_dtype_for_bits(int_bits: int) -> torch.dtype:

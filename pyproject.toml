@@ -5,6 +5,7 @@ description = "Deterministic inference for vLLM via fixed-point reductions"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "triton>=3.0",
     "vllm>=0.20.1",
 ]
 
@@ -12,7 +13,7 @@ dependencies = [
 fxpr_vllm = "fxpr_vllm.register:register"
 
 [build-system]
-requires = ["setuptools>=75.0", "wheel", "torch>=2.6"]
+requires = ["setuptools>=75.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [dependency-groups]

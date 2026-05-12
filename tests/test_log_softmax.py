@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-import fxpr_vllm._cuda  # noqa: F401
+import fxpr_vllm  # noqa: F401
 from fxpr_vllm.sampling import deterministic_log_softmax
 from tests.fixed_point_helpers import requires_cuda
 
