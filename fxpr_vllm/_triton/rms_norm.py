@@ -1,6 +1,9 @@
-"""RMSNorm with a fixed-point sum-of-squares.
+"""Batch-invariant RMSNorm: one Triton program per row, chunked over hidden.
 
-One program per row, chunked over hidden so it works at any width.
+The grid is (batch,) and the kernel never specialises on batch size, so every
+row reduces in the same order no matter how many are launched. That fixed
+order is the whole point. The sum stays in fp32; fixed-point x*x overflowed on
+real residual-stream activations.
 """
 
 from __future__ import annotations
@@ -9,8 +12,6 @@ import torch
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
-
-from .fxp import fxp_constants, float_to_fixed, fixed_to_float
 
 
 _BLOCK_N = 1024
@@ -26,11 +27,6 @@ def _rms_norm_kernel(
     stride_x,
     hidden,
     eps,
-    SCALE: tl.constexpr,
-    INV_SCALE: tl.constexpr,
-    QMIN: tl.constexpr,
-    QMAX: tl.constexpr,
-    INT_DTYPE: tl.constexpr,
     IO_DTYPE: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -41,7 +37,9 @@ def _rms_norm_kernel(
     if HAS_RESIDUAL:
         r_row = r_ptr + row * stride_x
 
-    acc = tl.zeros((), dtype=INT_DTYPE)
+    # Sum of squares in fp32. One program owns the whole row, so the reduction
+    # order is fixed across launches and the result is bit-identical per batch.
+    acc = tl.zeros((), dtype=tl.float32)
     for off in range(0, hidden, BLOCK_N):
         cols = off + tl.arange(0, BLOCK_N)
         mask = cols < hidden
@@ -51,10 +49,9 @@ def _rms_norm_kernel(
             xi = xi + ri
             tl.store(r_row + cols, xi.to(IO_DTYPE), mask=mask)
         sq = xi * xi
-        acc += tl.sum(float_to_fixed(sq, SCALE, QMIN, QMAX, INT_DTYPE), axis=0)
+        acc += tl.sum(sq, axis=0)
 
-    sum_f = fixed_to_float(acc, INV_SCALE)
-    mean_sq = tl.maximum(sum_f / hidden.to(tl.float32), 0.0)
+    mean_sq = tl.maximum(acc / hidden.to(tl.float32), 0.0)
     rrms = libdevice.rsqrt(mean_sq + eps)
 
     for off in range(0, hidden, BLOCK_N):
@@ -85,8 +82,6 @@ def _common_launch(
     w: torch.Tensor,
     residual: torch.Tensor | None,
     eps: float,
-    int_bits: int,
-    fxp_frac_bits: int,
 ) -> torch.Tensor:
     if not x.is_cuda or not w.is_cuda:
         raise RuntimeError("rms_norm: x and w must be CUDA")
@@ -119,9 +114,6 @@ def _common_launch(
             residual.copy_(r_storage.view_as(residual))
         return y_2d.view_as(x)
 
-    scale, inv_scale, qmin, qmax, tl_int_dtype, _ = fxp_constants(
-        int_bits, fxp_frac_bits
-    )
     io_dtype = _TORCH_TO_TL_FLOAT[x.dtype]
 
     grid = (batch,)
@@ -134,11 +126,6 @@ def _common_launch(
         x_2d.stride(0),
         hidden,
         float(eps),
-        SCALE=scale,
-        INV_SCALE=inv_scale,
-        QMIN=qmin,
-        QMAX=qmax,
-        INT_DTYPE=tl_int_dtype,
         IO_DTYPE=io_dtype,
         HAS_RESIDUAL=residual is not None,
         BLOCK_N=_BLOCK_N,
@@ -153,10 +140,8 @@ def rms_norm_fxp_run(
     x: torch.Tensor,
     w: torch.Tensor,
     eps: float,
-    int_bits: int,
-    fxp_frac_bits: int,
 ) -> torch.Tensor:
-    return _common_launch(x, w, None, eps, int_bits, fxp_frac_bits)
+    return _common_launch(x, w, None, eps)
 
 
 def rms_norm_fxp_residual_run(
@@ -164,7 +149,5 @@ def rms_norm_fxp_residual_run(
     residual: torch.Tensor,
     w: torch.Tensor,
     eps: float,
-    int_bits: int,
-    fxp_frac_bits: int,
 ) -> torch.Tensor:
-    return _common_launch(x, w, residual, eps, int_bits, fxp_frac_bits)
+    return _common_launch(x, w, residual, eps)

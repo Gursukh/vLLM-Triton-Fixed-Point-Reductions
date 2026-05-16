@@ -15,13 +15,11 @@ _lib = torch.library.Library("fxpr", "DEF")
 
 _lib.define("float_to_fixed(Tensor x, int int_bits, int fxp_frac_bits) -> Tensor")
 _lib.define("fixed_to_float(Tensor x, int float_bits, int fxp_frac_bits) -> Tensor")
-_lib.define(
-    "rms_norm_fxp(Tensor x, Tensor weight_fp32, float eps, "
-    "int fxp_int_bits, int fxp_frac_bits) -> Tensor"
-)
+# rms_norm reduces in fp32 (see _triton/rms_norm.py), so it takes no bits.
+_lib.define("rms_norm_fxp(Tensor x, Tensor weight_fp32, float eps) -> Tensor")
 _lib.define(
     "rms_norm_fxp_residual(Tensor x, Tensor(a!) residual, Tensor weight_fp32, "
-    "float eps, int fxp_int_bits, int fxp_frac_bits) -> Tensor"
+    "float eps) -> Tensor"
 )
 _lib.define("log_softmax_fxp(Tensor x, int fxp_int_bits, int fxp_frac_bits) -> Tensor")
 _lib.define(
@@ -63,18 +61,8 @@ def _fixed_to_float_cuda(x: torch.Tensor, float_bits: int, fxp_frac_bits: int):
 
 
 @torch.library.impl("fxpr::rms_norm_fxp", "CUDA", lib=_lib)
-def _rms_norm_fxp_cuda(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    fxp_int_bits: int,
-    fxp_frac_bits: int,
-):
-    _check_int_bits(fxp_int_bits)
-    _check_frac_bits(fxp_frac_bits)
-    return _triton_rms_norm.rms_norm_fxp_run(
-        x, weight, float(eps), int(fxp_int_bits), int(fxp_frac_bits)
-    )
+def _rms_norm_fxp_cuda(x: torch.Tensor, weight: torch.Tensor, eps: float):
+    return _triton_rms_norm.rms_norm_fxp_run(x, weight, float(eps))
 
 
 @torch.library.impl("fxpr::rms_norm_fxp_residual", "CUDA", lib=_lib)
@@ -83,13 +71,9 @@ def _rms_norm_fxp_residual_cuda(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    fxp_int_bits: int,
-    fxp_frac_bits: int,
 ):
-    _check_int_bits(fxp_int_bits)
-    _check_frac_bits(fxp_frac_bits)
     return _triton_rms_norm.rms_norm_fxp_residual_run(
-        x, residual, weight, float(eps), int(fxp_int_bits), int(fxp_frac_bits)
+        x, residual, weight, float(eps)
     )
 
 

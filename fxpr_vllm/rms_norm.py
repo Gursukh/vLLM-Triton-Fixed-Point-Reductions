@@ -4,17 +4,10 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 
 from .library_ops import rms_norm_fxp as rms_norm_fxp_op
 from .library_ops import rms_norm_fxp_residual as rms_norm_fxp_residual_op
-from .config import get_runtime_config
 
 
 class DeterministicRMSNorm(RMSNorm):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        cfg = get_runtime_config()
-        self._fxp_int_bits = cfg.fxp_int_bits
-        self._fxp_frac_bits = cfg.fxp_frac_bits
-
-    def forward_cuda(
+    def _forward_fxp(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
@@ -22,19 +15,15 @@ class DeterministicRMSNorm(RMSNorm):
         # vLLM fused-residual API: returns (normalised, residual += x).
         if residual is not None:
             out = rms_norm_fxp_residual_op(
-                x,
-                residual,
-                self.weight,
-                self.variance_epsilon,
-                self._fxp_int_bits,
-                self._fxp_frac_bits,
+                x, residual, self.weight, self.variance_epsilon
             )
             return out, residual
 
-        return rms_norm_fxp_op(
-            x,
-            self.weight,
-            self.variance_epsilon,
-            self._fxp_int_bits,
-            self._fxp_frac_bits,
-        )
+        return rms_norm_fxp_op(x, self.weight, self.variance_epsilon)
+
+    # vLLM calls forward_cuda with custom ops enabled and forward_native
+    # without, and it disables them by default under torch.compile. Bind
+    # both so the FXPR kernel runs whichever path vLLM picks; binding only
+    # forward_cuda silently fell back to stock (batch-variant) RMSNorm.
+    forward_cuda = _forward_fxp
+    forward_native = _forward_fxp

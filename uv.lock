@@ -1052,6 +1052,7 @@ name = "fxpr-vllm"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "triton" },
     { name = "vllm" },
 ]
 
@@ -1063,7 +1064,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "vllm", specifier = ">=0.20.1" }]
+requires-dist = [
+    { name = "triton", specifier = ">=3.0" },
+    { name = "vllm", specifier = ">=0.20.1" },
+]
 
 [package.metadata.requires-dev]
 dev = [

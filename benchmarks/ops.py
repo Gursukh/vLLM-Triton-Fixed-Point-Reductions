@@ -46,19 +46,17 @@ def _build_cast_i2f(shape, cfg):
 
 def _build_rms_norm(shape, cfg):
     N, Hd = shape["N"], shape["H"]
-    ib = cfg["int_bits"]
     x = torch.randn(N, Hd, device="cuda", dtype=torch.float16)
     w = torch.randn(Hd, device="cuda", dtype=torch.float16)
 
     def fn():
-        return torch.ops.fxpr.rms_norm_fxp(x, w, 1e-5, ib, _FRAC_BITS)
+        return torch.ops.fxpr.rms_norm_fxp(x, w, 1e-5)
 
     return fn, 4 * N * Hd, 2 * N * Hd * 4 + Hd * 4
 
 
 def _build_rms_norm_residual(shape, cfg):
     N, Hd = shape["N"], shape["H"]
-    ib = cfg["int_bits"]
     x = torch.randn(N, Hd, device="cuda", dtype=torch.float16)
     w = torch.randn(Hd, device="cuda", dtype=torch.float16)
     res_init = torch.randn(N, Hd, device="cuda", dtype=torch.float16)
@@ -67,7 +65,7 @@ def _build_rms_norm_residual(shape, cfg):
     # res is mutated in place; reset every call.
     def fn():
         res.copy_(res_init)
-        return torch.ops.fxpr.rms_norm_fxp_residual(x, res, w, 1e-5, ib, _FRAC_BITS)
+        return torch.ops.fxpr.rms_norm_fxp_residual(x, res, w, 1e-5)
 
     return fn, 5 * N * Hd, 3 * N * Hd * 4 + Hd * 4
 

@@ -12,7 +12,7 @@ def _run_rms_norm_kernel(
     assert x.dtype == torch.float32 and w.dtype == torch.float32
     assert x.ndim == 2 and w.ndim == 1
     assert x.shape[1] == w.shape[0]
-    return torch.ops.fxpr.rms_norm_fxp(x, w, eps, 64, 16)
+    return torch.ops.fxpr.rms_norm_fxp(x, w, eps)
 
 
 def _run_rms_norm_float_kernel(
@@ -57,28 +57,6 @@ def test_rms_norm_fixed_point_correctness(shape):
     assert torch.allclose(got, ref, atol=5e-4, rtol=5e-4)
 
 
-@requires_cuda
-@pytest.mark.parametrize("int_bits", [32, 64])
-def test_rms_norm_parametrized_int_bits(int_bits):
-    batch, hidden = 3, 16
-    g = torch.Generator(device="cuda").manual_seed(int_bits)
-
-    x = (
-        torch.rand((batch, hidden), device="cuda", dtype=torch.float32, generator=g)
-        - 0.5
-    )
-    w = (
-        torch.rand((hidden,), device="cuda", dtype=torch.float32, generator=g) - 0.5
-    ) * 2.0
-
-    got = torch.ops.fxpr.rms_norm_fxp(x, w, 1e-6, int_bits, 16)
-    ref = _run_rms_norm_float_kernel(x, w, eps=1e-6)
-
-    assert torch.allclose(got, ref, atol=5e-2, rtol=5e-2), (
-        f"max error = {(got - ref).abs().max().item()} at int_bits={int_bits}"
-    )
-
-
 _DTYPE_TOL = {
     torch.float32: (5e-4, 5e-4),
     torch.float16: (5e-3, 5e-3),
@@ -104,7 +82,7 @@ def test_rms_norm_native_dtype(dtype, shape):
     x = x_f32.to(dtype)
     w = w_f32.to(dtype)
 
-    got = torch.ops.fxpr.rms_norm_fxp(x, w, 1e-6, 64, 16)
+    got = torch.ops.fxpr.rms_norm_fxp(x, w, 1e-6)
     assert got.dtype == dtype, f"output dtype {got.dtype} != input dtype {dtype}"
 
     # Reference is fp32 + cast, matching the kernel's internals.
@@ -142,7 +120,7 @@ def test_rms_norm_residual_native_dtype(dtype):
     r_orig = r.clone()
     w = w_f32.to(dtype)
 
-    out = torch.ops.fxpr.rms_norm_fxp_residual(x, r, w, 1e-6, 64, 16)
+    out = torch.ops.fxpr.rms_norm_fxp_residual(x, r, w, 1e-6)
     assert out.dtype == dtype
     assert r.dtype == dtype
     # `r` is mutated in place to (x + r).

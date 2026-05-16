@@ -36,14 +36,12 @@ def _fixed_to_float_fake(x, float_bits, fxp_frac_bits):
 
 
 @torch.library.register_fake("fxpr::rms_norm_fxp")
-def _rms_norm_fxp_fake(x, weight_fp32, eps, fxp_int_bits, fxp_frac_bits):
+def _rms_norm_fxp_fake(x, weight_fp32, eps):
     return torch.empty_like(x)
 
 
 @torch.library.register_fake("fxpr::rms_norm_fxp_residual")
-def _rms_norm_fxp_residual_fake(
-    x, residual, weight_fp32, eps, fxp_int_bits, fxp_frac_bits
-):
+def _rms_norm_fxp_residual_fake(x, residual, weight_fp32, eps):
     return torch.empty_like(x)
 
 
