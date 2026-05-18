@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization import register_quantization_config
 
 from .library_ops import gemm_fxp
 from .config import get_runtime_config
+from .warmup import warmup_gemm
 
 
 @register_quantization_config("fixed_point_det")
@@ -110,6 +111,10 @@ class FixedPointLinearMethod(QuantizeMethodBase):
         del layer.weight
         layer.register_parameter("weight", None)
 
+        # Compile the gemm_fxp kernels for this weight shape now, at load time,
+        # so the first serving request doesn't eat a JIT spike.
+        warmup_gemm(layer.weight_native, self.fxp_int_bits, self.fxp_frac_bits)
+
     def apply(
         self,
         layer: nn.Module,
@@ -163,6 +168,9 @@ class FixedPointEmbeddingMethod(QuantizeMethodBase):
         # the ParallelLMHead matmul.
         with torch.no_grad():
             layer.weight_native = layer.weight.data.t().contiguous()
+
+        # Compile the gemm_fxp kernels for the lm_head shape at load time.
+        warmup_gemm(layer.weight_native, self.fxp_int_bits, self.fxp_frac_bits)
 
     def apply(
         self,

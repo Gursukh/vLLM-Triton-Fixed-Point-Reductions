@@ -1,10 +1,8 @@
-"""Unified prefill + decode attention over paged KV with split-K.
-
-Three kernels: split_max finds per-split row max, split_dv accumulates the
-denominator and weighted-V using that max, combine reduces across splits
-and divides. qk dot, denom, and weighted-V are all integer reductions;
-only the per-row max stays fp32. softmax_scale is pre-multiplied by
-1/ln(2) so qk lives in log2 space and we use exp2.
+"""Unified prefill + decode attention over paged KV, tensor-core tiled.
+A fused kernel for num_splits == 1, a two-kernel split path otherwise. tl.dot
+does the within-tile QK^T and P*V; cross-tile reductions stay integer
+fixed-point sums, so the result is batch-invariant. softmax_scale is pre-scaled
+by 1/ln(2) for log2-space exp2.
 """
 
 from __future__ import annotations
@@ -28,6 +26,17 @@ _TORCH_TO_TL_FLOAT = {
     torch.bfloat16: tl.bfloat16,
 }
 
+# Key-tile width = the determinism granularity (mirrors gemm's _BLOCK_K_BY_DTYPE).
+# Fixed per dtype: splits and causal edges are BLOCK_N-aligned so a tl.dot tile
+# always contracts the same keys in the same order.
+_BLOCK_N_BY_DTYPE = {
+    torch.float16: 64,
+    torch.bfloat16: 64,
+    torch.float32: 32,
+}
+
+_SPLIT_OCCUPANCY = 2  # allow ~2 split programs per SM for latency hiding
+
 
 def _next_pow2(n: int) -> int:
     if n <= 1:
@@ -35,36 +44,260 @@ def _next_pow2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+# Cached (compute_capability, SM count) per device; the launcher runs per
+# layer, so re-querying the device every call is wasted host time.
+_ARCH_CACHE: dict[int, tuple[int, int]] = {}
+
+
+def _arch_info(device: torch.device) -> tuple[int, int]:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    info = _ARCH_CACHE.get(idx)
+    if info is None:
+        props = torch.cuda.get_device_properties(idx)
+        info = (props.major * 10 + props.minor, props.multi_processor_count)
+        _ARCH_CACHE[idx] = info
+    return info
+
+
+def _check_arch(dtype: torch.dtype, device: torch.device) -> None:
+    cap, _ = _arch_info(device)
+    if cap < 75:
+        raise RuntimeError(
+            f"unified_attention_fxp: requires compute capability >= 7.5 "
+            f"(Turing); device is {cap // 10}.{cap % 10}"
+        )
+    if dtype in (torch.bfloat16, torch.float32) and cap < 80:
+        name = "bfloat16" if dtype == torch.bfloat16 else "float32"
+        raise RuntimeError(
+            f"unified_attention_fxp: {name} inputs require compute capability "
+            f">= 8.0 (Ampere) for tensor-core tl.dot; device is "
+            f"{cap // 10}.{cap % 10}. Use float16 inputs."
+        )
+
+
 @triton.jit
-def _compute_chunk(key_start, key_end, num_splits, split_index):
-    total = key_end - key_start
-    s_lo = split_index.to(tl.int64) * total.to(tl.int64)
-    s_hi = (split_index + 1).to(tl.int64) * total.to(tl.int64)
-    chunk_start = key_start + (s_lo // num_splits).to(tl.int32)
-    chunk_end = key_start + (s_hi // num_splits).to(tl.int32)
+def _split_tile_range(lo, hi, num_splits, split_index, BLOCK_N: tl.constexpr):
+    """BLOCK_N-aligned key range owned by `split_index`. Whole tiles are
+    dealt evenly across splits; boundaries do not depend on num_splits, so
+    the integer partials are split-invariant."""
+    total = hi - lo
+    n_tiles = tl.maximum(tl.cdiv(total, BLOCK_N), 0)
+    per_split = tl.cdiv(n_tiles, num_splits)
+    t_start = split_index * per_split
+    t_end = tl.minimum(t_start + per_split, n_tiles)
+    chunk_start = lo + t_start * BLOCK_N
+    chunk_end = lo + tl.maximum(t_end, t_start) * BLOCK_N
     return chunk_start, chunk_end
 
 
 @triton.jit
-def _post_process_qk(
-    qk_fxp,
+def _qk_post(
+    scores,
     softmax_scale_log2,
     softcap_log2,
     alibi_slope,
-    kp,
+    n_off,
     q_abs_pos,
-    INV_SCALE: tl.constexpr,
     HAS_SOFTCAP: tl.constexpr,
+    HAS_ALIBI: tl.constexpr,
 ):
-    qk = fixed_to_float(qk_fxp, INV_SCALE)
-    qk = qk * softmax_scale_log2
+    """Scale / softcap / alibi a [BLOCK_M, BLOCK_N] raw-qk score tile."""
+    scores = scores * softmax_scale_log2
     if HAS_SOFTCAP:
-        qk = softcap_log2 * libdevice.tanh(qk / softcap_log2)
-    qk = qk + alibi_slope * (kp.to(tl.float32) - q_abs_pos.to(tl.float32))
-    return qk
+        scores = softcap_log2 * libdevice.tanh(scores / softcap_log2)
+    if HAS_ALIBI:
+        scores = scores + alibi_slope * (
+            n_off[None, :].to(tl.float32) - q_abs_pos[:, None].to(tl.float32)
+        )
+    return scores
 
 
-@triton.jit
+# do_not_specialize stride_block_table_row: it depends on max_model_len, so
+# warmup and real requests differ, forcing a recompile. It only offsets a small
+# int32 gather, so specializing it buys nothing.
+@triton.jit(
+    do_not_specialize=["stride_block_table_row"],
+    do_not_specialize_on_alignment=["stride_block_table_row"],
+)
+def _attn_fused_kernel(
+    Q_ptr,
+    K_ptr,
+    V_ptr,
+    O_ptr,
+    qsl_ptr,
+    seq_lens_ptr,
+    block_table_ptr,
+    alibi_slopes_ptr,
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    page_size,
+    window_size,
+    stride_q_token,
+    stride_q_head,
+    stride_k_block,
+    stride_k_slot,
+    stride_k_head,
+    stride_v_block,
+    stride_v_slot,
+    stride_v_head,
+    stride_o_token,
+    stride_o_head,
+    stride_block_table_row,
+    softmax_scale_log2,
+    softcap_log2,
+    SCALE: tl.constexpr,
+    INV_SCALE: tl.constexpr,
+    QMIN: tl.constexpr,
+    QMAX: tl.constexpr,
+    INT_DTYPE: tl.constexpr,
+    IO_DTYPE: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    HAS_ALIBI: tl.constexpr,
+    HAS_SOFTCAP: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    HAS_WINDOW: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Single-kernel attention for num_splits == 1. One program owns its
+    (req, q_block, head) key range and runs both passes (row-max, then
+    denominator + weighted-V) as two K-loops, with no scratch or atomics.
+    Integer accumulators keep it bit-identical to the split path."""
+    req = tl.program_id(axis=0)
+    q_block = tl.program_id(axis=1)
+    head_index = tl.program_id(axis=2)
+    kv_group = num_heads // num_kv_heads
+    kv_head_index = head_index // kv_group
+
+    q_start = tl.load(qsl_ptr + req)
+    q_end = tl.load(qsl_ptr + req + 1)
+    q_len = q_end - q_start
+    m_base = q_block * BLOCK_M
+    if m_base >= q_len:
+        return
+
+    seq_len = tl.load(seq_lens_ptr + req)
+    context_len = seq_len - q_len
+
+    m_off = tl.arange(0, BLOCK_M)
+    q_in_req = m_base + m_off
+    row_valid = q_in_req < q_len
+    q_token_idx = q_start + q_in_req
+    q_abs_pos = context_len + q_in_req
+
+    if IS_CAUSAL:
+        hi = tl.minimum(seq_len, context_len + m_base + BLOCK_M)
+    else:
+        hi = seq_len
+    if HAS_WINDOW:
+        lo = tl.maximum(0, (context_len + m_base) - window_size + 1)
+    else:
+        lo = 0
+
+    if IS_CAUSAL:
+        key_end_row = q_abs_pos + 1
+    else:
+        key_end_row = seq_len + 0 * q_abs_pos
+    if HAS_WINDOW:
+        key_start_row = tl.maximum(0, q_abs_pos - window_size + 1)
+    else:
+        key_start_row = 0 * q_abs_pos
+
+    if HAS_ALIBI:
+        alibi_slope = tl.load(alibi_slopes_ptr + head_index)
+    else:
+        alibi_slope = 0.0
+
+    d_off = tl.arange(0, BLOCK_D)
+    d_mask = d_off < head_dim
+    q_ptrs = (
+        Q_ptr
+        + q_token_idx[:, None] * stride_q_token
+        + head_index * stride_q_head
+        + d_off[None, :]
+    )
+    q_tile = tl.load(q_ptrs, mask=row_valid[:, None] & d_mask[None, :], other=0.0)
+    bt_row = block_table_ptr + req * stride_block_table_row
+
+    # Pass 1: per-row max over the whole key range.
+    row_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+    for kn in range(lo, hi, BLOCK_N):
+        n_off = kn + tl.arange(0, BLOCK_N)
+        n_in_seq = n_off < seq_len
+        logical_block = n_off // page_size
+        slot = n_off % page_size
+        phys = tl.load(bt_row + logical_block, mask=n_in_seq, other=0)
+        kv_base = phys * stride_k_block + slot * stride_k_slot + kv_head_index * stride_k_head
+        k_ptrs = K_ptr + kv_base[None, :] + d_off[:, None]
+        k_tile = tl.load(k_ptrs, mask=n_in_seq[None, :] & d_mask[:, None], other=0.0)
+        scores = tl.dot(q_tile, k_tile, allow_tf32=ALLOW_TF32, out_dtype=tl.float32)
+        scores = _qk_post(
+            scores, softmax_scale_log2, softcap_log2, alibi_slope,
+            n_off, q_abs_pos, HAS_SOFTCAP, HAS_ALIBI,
+        )
+        valid = (
+            (n_off[None, :] >= key_start_row[:, None])
+            & (n_off[None, :] < key_end_row[:, None])
+            & row_valid[:, None]
+        )
+        scores = tl.where(valid, scores, -float("inf"))
+        row_max = tl.maximum(row_max, tl.max(scores, axis=1))
+    # Invalid rows have no key; pin to 0 so exp2 gives 0, not nan.
+    global_max = tl.where(row_valid, row_max, 0.0)
+
+    # Pass 2: integer-accumulate the denominator and weighted-V.
+    denom_acc = tl.zeros((BLOCK_M,), dtype=INT_DTYPE)
+    wv_acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=INT_DTYPE)
+    for kn in range(lo, hi, BLOCK_N):
+        n_off = kn + tl.arange(0, BLOCK_N)
+        n_in_seq = n_off < seq_len
+        logical_block = n_off // page_size
+        slot = n_off % page_size
+        phys = tl.load(bt_row + logical_block, mask=n_in_seq, other=0)
+        k_base = phys * stride_k_block + slot * stride_k_slot + kv_head_index * stride_k_head
+        k_ptrs = K_ptr + k_base[None, :] + d_off[:, None]
+        k_tile = tl.load(k_ptrs, mask=n_in_seq[None, :] & d_mask[:, None], other=0.0)
+        v_base = phys * stride_v_block + slot * stride_v_slot + kv_head_index * stride_v_head
+        v_ptrs = V_ptr + v_base[:, None] + d_off[None, :]
+        v_tile = tl.load(v_ptrs, mask=n_in_seq[:, None] & d_mask[None, :], other=0.0)
+        scores = tl.dot(q_tile, k_tile, allow_tf32=ALLOW_TF32, out_dtype=tl.float32)
+        scores = _qk_post(
+            scores, softmax_scale_log2, softcap_log2, alibi_slope,
+            n_off, q_abs_pos, HAS_SOFTCAP, HAS_ALIBI,
+        )
+        valid = (
+            (n_off[None, :] >= key_start_row[:, None])
+            & (n_off[None, :] < key_end_row[:, None])
+            & row_valid[:, None]
+        )
+        scores = tl.where(valid, scores, -float("inf"))
+        weight = libdevice.exp2(scores - global_max[:, None])
+        denom_acc += tl.sum(float_to_fixed(weight, SCALE, QMIN, QMAX, INT_DTYPE), axis=1)
+        pv = tl.dot(
+            weight.to(IO_DTYPE), v_tile, allow_tf32=ALLOW_TF32, out_dtype=tl.float32
+        )
+        wv_acc += float_to_fixed(pv, SCALE, QMIN, QMAX, INT_DTYPE)
+
+    denom = tl.maximum(fixed_to_float(denom_acc, INV_SCALE), 1.0e-6)
+    num = fixed_to_float(wv_acc, INV_SCALE)
+    out = num / denom[:, None]
+    o_ptrs = (
+        O_ptr
+        + q_token_idx[:, None] * stride_o_token
+        + head_index * stride_o_head
+        + d_off[None, :]
+    )
+    tl.store(o_ptrs, out.to(IO_DTYPE), mask=row_valid[:, None] & d_mask[None, :])
+
+
+# See _attn_fused_kernel; num_splits is also excluded so the split count can't
+# force a recompile (BLOCK_S still varies, but warmup covers it).
+@triton.jit(
+    do_not_specialize=["stride_block_table_row", "num_splits"],
+    do_not_specialize_on_alignment=["stride_block_table_row", "num_splits"],
+)
 def _attn_split_max_kernel(
     Q_ptr,
     K_ptr,
@@ -90,19 +323,17 @@ def _attn_split_max_kernel(
     stride_block_table_row,
     softmax_scale_log2,
     softcap_log2,
-    SCALE: tl.constexpr,
-    INV_SCALE: tl.constexpr,
-    QMIN: tl.constexpr,
-    QMAX: tl.constexpr,
-    INT_DTYPE: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
     HAS_ALIBI: tl.constexpr,
     HAS_SOFTCAP: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     HAS_WINDOW: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     req = tl.program_id(axis=0)
-    q_in_req = tl.program_id(axis=1)
+    q_block = tl.program_id(axis=1)
     hs = tl.program_id(axis=2)
     head_index = hs // num_splits
     split_index = hs % num_splits
@@ -112,26 +343,39 @@ def _attn_split_max_kernel(
     q_start = tl.load(qsl_ptr + req)
     q_end = tl.load(qsl_ptr + req + 1)
     q_len = q_end - q_start
-    if q_in_req >= q_len:
+    m_base = q_block * BLOCK_M
+    if m_base >= q_len:
         return
 
     seq_len = tl.load(seq_lens_ptr + req)
     context_len = seq_len - q_len
+
+    m_off = tl.arange(0, BLOCK_M)
+    q_in_req = m_base + m_off
+    row_valid = q_in_req < q_len
     q_token_idx = q_start + q_in_req
     q_abs_pos = context_len + q_in_req
 
+    # Block-uniform key range [lo, hi) covering every row's causal/window span.
     if IS_CAUSAL:
-        key_end = q_abs_pos + 1
+        hi = tl.minimum(seq_len, context_len + m_base + BLOCK_M)
     else:
-        key_end = seq_len
+        hi = seq_len
     if HAS_WINDOW:
-        key_start = tl.maximum(0, q_abs_pos - window_size + 1)
+        lo = tl.maximum(0, (context_len + m_base) - window_size + 1)
     else:
-        key_start = 0
+        lo = 0
+    chunk_start, chunk_end = _split_tile_range(lo, hi, num_splits, split_index, BLOCK_N)
 
-    chunk_start, chunk_end = _compute_chunk(key_start, key_end, num_splits, split_index)
-    if chunk_start >= chunk_end:
-        return
+    # Per-row key bounds for masking the ragged causal/window edge.
+    if IS_CAUSAL:
+        key_end_row = q_abs_pos + 1
+    else:
+        key_end_row = seq_len + 0 * q_abs_pos
+    if HAS_WINDOW:
+        key_start_row = tl.maximum(0, q_abs_pos - window_size + 1)
+    else:
+        key_start_row = 0 * q_abs_pos
 
     if HAS_ALIBI:
         alibi_slope = tl.load(alibi_slopes_ptr + head_index)
@@ -140,55 +384,63 @@ def _attn_split_max_kernel(
 
     d_off = tl.arange(0, BLOCK_D)
     d_mask = d_off < head_dim
-    q_row = Q_ptr + q_token_idx * stride_q_token + head_index * stride_q_head
-    q_vec = tl.load(q_row + d_off, mask=d_mask, other=0.0).to(tl.float32)
+    q_ptrs = (
+        Q_ptr
+        + q_token_idx[:, None] * stride_q_token
+        + head_index * stride_q_head
+        + d_off[None, :]
+    )
+    q_tile = tl.load(q_ptrs, mask=row_valid[:, None] & d_mask[None, :], other=0.0)
     bt_row = block_table_ptr + req * stride_block_table_row
 
-    row_max = -float("inf")
-    for kp in range(chunk_start, chunk_end):
-        logical_block = kp // page_size
-        slot = kp % page_size
-        physical_block = tl.load(bt_row + logical_block)
-        k_row = (
-            K_ptr
-            + physical_block * stride_k_block
-            + slot * stride_k_slot
-            + kv_head_index * stride_k_head
+    row_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+    for kn in range(chunk_start, chunk_end, BLOCK_N):
+        n_off = kn + tl.arange(0, BLOCK_N)
+        n_in_seq = n_off < seq_len
+        logical_block = n_off // page_size
+        slot = n_off % page_size
+        phys = tl.load(bt_row + logical_block, mask=n_in_seq, other=0)
+        kv_base = phys * stride_k_block + slot * stride_k_slot + kv_head_index * stride_k_head
+        k_ptrs = K_ptr + kv_base[None, :] + d_off[:, None]
+        k_tile = tl.load(
+            k_ptrs, mask=n_in_seq[None, :] & d_mask[:, None], other=0.0
         )
-        k_vec = tl.load(k_row + d_off, mask=d_mask, other=0.0).to(tl.float32)
-        prod = q_vec * k_vec
-        qk_fxp = tl.sum(
-            float_to_fixed(prod, SCALE, QMIN, QMAX, INT_DTYPE), axis=0
+        scores = tl.dot(q_tile, k_tile, allow_tf32=ALLOW_TF32, out_dtype=tl.float32)
+        scores = _qk_post(
+            scores, softmax_scale_log2, softcap_log2, alibi_slope,
+            n_off, q_abs_pos, HAS_SOFTCAP, HAS_ALIBI,
         )
-        qk = _post_process_qk(
-            qk_fxp,
-            softmax_scale_log2,
-            softcap_log2,
-            alibi_slope,
-            kp,
-            q_abs_pos,
-            INV_SCALE,
-            HAS_SOFTCAP,
+        valid = (
+            (n_off[None, :] >= key_start_row[:, None])
+            & (n_off[None, :] < key_end_row[:, None])
+            & row_valid[:, None]
         )
-        row_max = tl.maximum(row_max, qk)
+        scores = tl.where(valid, scores, -float("inf"))
+        row_max = tl.maximum(row_max, tl.max(scores, axis=1))
 
-    out_ptr = (
+    pm_ptrs = (
         partial_max_ptr
         + q_token_idx * stride_pmax_token
         + head_index * stride_pmax_head
         + split_index * stride_pmax_split
     )
-    tl.store(out_ptr, row_max)
+    tl.store(pm_ptrs, row_max, mask=row_valid)
 
 
-@triton.jit
+# See _attn_split_max_kernel.
+@triton.jit(
+    do_not_specialize=["stride_block_table_row", "num_splits"],
+    do_not_specialize_on_alignment=["stride_block_table_row", "num_splits"],
+)
 def _attn_split_dv_kernel(
     Q_ptr,
     K_ptr,
     V_ptr,
     partial_max_ptr,
-    partial_denom_ptr,
-    partial_wv_ptr,
+    total_denom_ptr,
+    total_wv_ptr,
+    lock_ptr,
+    O_ptr,
     qsl_ptr,
     seq_lens_ptr,
     block_table_ptr,
@@ -210,13 +462,15 @@ def _attn_split_dv_kernel(
     stride_pmax_token,
     stride_pmax_head,
     stride_pmax_split,
-    stride_pdenom_token,
-    stride_pdenom_head,
-    stride_pdenom_split,
-    stride_pwv_token,
-    stride_pwv_head,
-    stride_pwv_split,
-    stride_pwv_d,
+    stride_td_token,
+    stride_td_head,
+    stride_twv_token,
+    stride_twv_head,
+    stride_twv_d,
+    stride_lock_token,
+    stride_lock_head,
+    stride_o_token,
+    stride_o_head,
     stride_block_table_row,
     softmax_scale_log2,
     softcap_log2,
@@ -225,15 +479,19 @@ def _attn_split_dv_kernel(
     QMIN: tl.constexpr,
     QMAX: tl.constexpr,
     INT_DTYPE: tl.constexpr,
+    IO_DTYPE: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
     HAS_ALIBI: tl.constexpr,
     HAS_SOFTCAP: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     HAS_WINDOW: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
     req = tl.program_id(axis=0)
-    q_in_req = tl.program_id(axis=1)
+    q_block = tl.program_id(axis=1)
     hs = tl.program_id(axis=2)
     head_index = hs // num_splits
     split_index = hs % num_splits
@@ -243,26 +501,39 @@ def _attn_split_dv_kernel(
     q_start = tl.load(qsl_ptr + req)
     q_end = tl.load(qsl_ptr + req + 1)
     q_len = q_end - q_start
-    if q_in_req >= q_len:
+    m_base = q_block * BLOCK_M
+    if m_base >= q_len:
         return
 
     seq_len = tl.load(seq_lens_ptr + req)
     context_len = seq_len - q_len
+
+    m_off = tl.arange(0, BLOCK_M)
+    q_in_req = m_base + m_off
+    row_valid = q_in_req < q_len
     q_token_idx = q_start + q_in_req
     q_abs_pos = context_len + q_in_req
 
     if IS_CAUSAL:
-        key_end = q_abs_pos + 1
+        hi = tl.minimum(seq_len, context_len + m_base + BLOCK_M)
     else:
-        key_end = seq_len
+        hi = seq_len
     if HAS_WINDOW:
-        key_start = tl.maximum(0, q_abs_pos - window_size + 1)
+        lo = tl.maximum(0, (context_len + m_base) - window_size + 1)
     else:
-        key_start = 0
+        lo = 0
+    # An empty chunk still arrives at the counter; every split must arrive or
+    # the last-arrival epilogue never fires.
+    chunk_start, chunk_end = _split_tile_range(lo, hi, num_splits, split_index, BLOCK_N)
 
-    chunk_start, chunk_end = _compute_chunk(key_start, key_end, num_splits, split_index)
-    if chunk_start >= chunk_end:
-        return
+    if IS_CAUSAL:
+        key_end_row = q_abs_pos + 1
+    else:
+        key_end_row = seq_len + 0 * q_abs_pos
+    if HAS_WINDOW:
+        key_start_row = tl.maximum(0, q_abs_pos - window_size + 1)
+    else:
+        key_start_row = 0 * q_abs_pos
 
     if HAS_ALIBI:
         alibi_slope = tl.load(alibi_slopes_ptr + head_index)
@@ -271,159 +542,132 @@ def _attn_split_dv_kernel(
 
     d_off = tl.arange(0, BLOCK_D)
     d_mask = d_off < head_dim
-    q_row = Q_ptr + q_token_idx * stride_q_token + head_index * stride_q_head
-    q_vec = tl.load(q_row + d_off, mask=d_mask, other=0.0).to(tl.float32)
+    q_ptrs = (
+        Q_ptr
+        + q_token_idx[:, None] * stride_q_token
+        + head_index * stride_q_head
+        + d_off[None, :]
+    )
+    q_tile = tl.load(q_ptrs, mask=row_valid[:, None] & d_mask[None, :], other=0.0)
     bt_row = block_table_ptr + req * stride_block_table_row
 
-    # Fold the per-split row maxes from pass 1 into a single max for this token+head.
-    pm_row = partial_max_ptr + q_token_idx * stride_pmax_token + head_index * stride_pmax_head
+    # Fold the per-split row maxes from pass 1 into one global max per row.
     s_off = tl.arange(0, BLOCK_S)
     s_mask = s_off < num_splits
-    pm_vals = tl.load(pm_row + s_off * stride_pmax_split, mask=s_mask, other=-float("inf"))
-    global_max = tl.max(pm_vals, axis=0)
-
-    out_acc = tl.zeros((BLOCK_D,), dtype=INT_DTYPE)
-    denom_partial = tl.zeros((), dtype=INT_DTYPE)
-
-    for kp in range(chunk_start, chunk_end):
-        logical_block = kp // page_size
-        slot = kp % page_size
-        physical_block = tl.load(bt_row + logical_block)
-        k_row = (
-            K_ptr
-            + physical_block * stride_k_block
-            + slot * stride_k_slot
-            + kv_head_index * stride_k_head
-        )
-        v_row = (
-            V_ptr
-            + physical_block * stride_v_block
-            + slot * stride_v_slot
-            + kv_head_index * stride_v_head
-        )
-        k_vec = tl.load(k_row + d_off, mask=d_mask, other=0.0).to(tl.float32)
-        v_vec = tl.load(v_row + d_off, mask=d_mask, other=0.0).to(tl.float32)
-
-        prod = q_vec * k_vec
-        qk_fxp = tl.sum(
-            float_to_fixed(prod, SCALE, QMIN, QMAX, INT_DTYPE), axis=0
-        )
-        qk = _post_process_qk(
-            qk_fxp,
-            softmax_scale_log2,
-            softcap_log2,
-            alibi_slope,
-            kp,
-            q_abs_pos,
-            INV_SCALE,
-            HAS_SOFTCAP,
-        )
-        weight = libdevice.exp2(qk - global_max)
-        weight_fxp = float_to_fixed(weight, SCALE, QMIN, QMAX, INT_DTYPE)
-        denom_partial = denom_partial + weight_fxp
-
-        wv_prod = weight * v_vec
-        out_acc = out_acc + float_to_fixed(wv_prod, SCALE, QMIN, QMAX, INT_DTYPE)
-
-    pdenom_ptr = (
-        partial_denom_ptr
-        + q_token_idx * stride_pdenom_token
-        + head_index * stride_pdenom_head
-        + split_index * stride_pdenom_split
+    pm_ptrs = (
+        partial_max_ptr
+        + q_token_idx[:, None] * stride_pmax_token
+        + head_index * stride_pmax_head
+        + s_off[None, :] * stride_pmax_split
     )
-    tl.store(pdenom_ptr, denom_partial)
-
-    pwv_row = (
-        partial_wv_ptr
-        + q_token_idx * stride_pwv_token
-        + head_index * stride_pwv_head
-        + split_index * stride_pwv_split
+    pm_vals = tl.load(
+        pm_ptrs, mask=row_valid[:, None] & s_mask[None, :], other=-float("inf")
     )
-    tl.store(pwv_row + d_off * stride_pwv_d, out_acc, mask=d_mask)
+    global_max = tl.max(pm_vals, axis=1)
+    # Invalid rows have no stored max; pin to 0 so exp2 gives 0, not nan.
+    global_max = tl.where(row_valid, global_max, 0.0)
 
+    denom_acc = tl.zeros((BLOCK_M,), dtype=INT_DTYPE)
+    wv_acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=INT_DTYPE)
 
-@triton.jit
-def _attn_combine_kernel(
-    partial_denom_ptr,
-    partial_wv_ptr,
-    O_ptr,
-    qsl_ptr,
-    num_heads,
-    head_dim,
-    num_splits,
-    stride_pdenom_token,
-    stride_pdenom_head,
-    stride_pdenom_split,
-    stride_pwv_token,
-    stride_pwv_head,
-    stride_pwv_split,
-    stride_pwv_d,
-    stride_o_token,
-    stride_o_head,
-    INV_SCALE: tl.constexpr,
-    INT_DTYPE: tl.constexpr,
-    IO_DTYPE: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_S: tl.constexpr,
-):
-    req = tl.program_id(axis=0)
-    q_in_req = tl.program_id(axis=1)
-    head_index = tl.program_id(axis=2)
+    for kn in range(chunk_start, chunk_end, BLOCK_N):
+        n_off = kn + tl.arange(0, BLOCK_N)
+        n_in_seq = n_off < seq_len
+        logical_block = n_off // page_size
+        slot = n_off % page_size
+        phys = tl.load(bt_row + logical_block, mask=n_in_seq, other=0)
+        k_base = phys * stride_k_block + slot * stride_k_slot + kv_head_index * stride_k_head
+        k_ptrs = K_ptr + k_base[None, :] + d_off[:, None]
+        k_tile = tl.load(k_ptrs, mask=n_in_seq[None, :] & d_mask[:, None], other=0.0)
+        v_base = phys * stride_v_block + slot * stride_v_slot + kv_head_index * stride_v_head
+        v_ptrs = V_ptr + v_base[:, None] + d_off[None, :]
+        v_tile = tl.load(v_ptrs, mask=n_in_seq[:, None] & d_mask[None, :], other=0.0)
 
-    q_start = tl.load(qsl_ptr + req)
-    q_end = tl.load(qsl_ptr + req + 1)
-    q_len = q_end - q_start
-    if q_in_req >= q_len:
-        return
-    q_token_idx = q_start + q_in_req
+        scores = tl.dot(q_tile, k_tile, allow_tf32=ALLOW_TF32, out_dtype=tl.float32)
+        scores = _qk_post(
+            scores, softmax_scale_log2, softcap_log2, alibi_slope,
+            n_off, q_abs_pos, HAS_SOFTCAP, HAS_ALIBI,
+        )
+        valid = (
+            (n_off[None, :] >= key_start_row[:, None])
+            & (n_off[None, :] < key_end_row[:, None])
+            & row_valid[:, None]
+        )
+        scores = tl.where(valid, scores, -float("inf"))
 
-    s_off = tl.arange(0, BLOCK_S)
-    s_mask = s_off < num_splits
-    d_off = tl.arange(0, BLOCK_D)
-    d_mask = d_off < head_dim
+        # exp2 of a masked (-inf) score is exactly 0, so it does not contribute.
+        weight = libdevice.exp2(scores - global_max[:, None])
+        # Denominator: per-key quantize then integer-sum across the tile.
+        denom_acc += tl.sum(float_to_fixed(weight, SCALE, QMIN, QMAX, INT_DTYPE), axis=1)
+        # P*V via tl.dot in fp32 (fixed tile shape, so deterministic); the
+        # per-tile partial is quantized and the cross-tile sum stays integer.
+        pv = tl.dot(
+            weight.to(IO_DTYPE), v_tile, allow_tf32=ALLOW_TF32, out_dtype=tl.float32
+        )
+        wv_acc += float_to_fixed(pv, SCALE, QMIN, QMAX, INT_DTYPE)
 
-    pdenom_row = (
-        partial_denom_ptr
-        + q_token_idx * stride_pdenom_token
-        + head_index * stride_pdenom_head
+    # Accumulate this split into the per-(token, head) integer totals. Integer
+    # atomic-add is commutative, so the cross-split reduction is order-free.
+    td_ptrs = total_denom_ptr + q_token_idx * stride_td_token + head_index * stride_td_head
+    tl.atomic_add(td_ptrs, denom_acc, mask=row_valid, sem="relaxed")
+    twv_ptrs = (
+        total_wv_ptr
+        + q_token_idx[:, None] * stride_twv_token
+        + head_index * stride_twv_head
+        + d_off[None, :] * stride_twv_d
     )
-    denom_parts = tl.load(pdenom_row + s_off * stride_pdenom_split, mask=s_mask, other=0)
-    denom_sum = tl.sum(denom_parts, axis=0)
+    tl.atomic_add(
+        twv_ptrs, wv_acc, mask=row_valid[:, None] & d_mask[None, :], sem="relaxed"
+    )
+
+    # Fused combine: the last split to arrive divides and writes O. The acq_rel
+    # increment makes its loads see every split's atomic-add, so the result is
+    # the same regardless of arrival order.
+    lk_ptrs = lock_ptr + q_token_idx * stride_lock_token + head_index * stride_lock_head
+    arrived = tl.atomic_add(
+        lk_ptrs, tl.full((BLOCK_M,), 1, tl.int32), mask=row_valid, sem="acq_rel"
+    )
+    is_last = (arrived == num_splits - 1) & row_valid
+
+    denom_sum = tl.load(td_ptrs, mask=row_valid, other=0)
     denom = tl.maximum(fixed_to_float(denom_sum, INV_SCALE), 1.0e-6)
-
-    pwv_row = (
-        partial_wv_ptr
-        + q_token_idx * stride_pwv_token
-        + head_index * stride_pwv_head
-    )
-    wv_tile = tl.load(
-        pwv_row + s_off[:, None] * stride_pwv_split + d_off[None, :] * stride_pwv_d,
-        mask=s_mask[:, None] & d_mask[None, :],
-        other=0,
-    )
-    wv_sum = tl.sum(wv_tile, axis=0)
+    wv_sum = tl.load(twv_ptrs, mask=row_valid[:, None] & d_mask[None, :], other=0)
     num = fixed_to_float(wv_sum, INV_SCALE)
-    out = num / denom
+    out = num / denom[:, None]
+    o_ptrs = (
+        O_ptr
+        + q_token_idx[:, None] * stride_o_token
+        + head_index * stride_o_head
+        + d_off[None, :]
+    )
+    tl.store(o_ptrs, out.to(IO_DTYPE), mask=is_last[:, None] & d_mask[None, :])
 
-    o_row = O_ptr + q_token_idx * stride_o_token + head_index * stride_o_head
-    tl.store(o_row + d_off, out.to(IO_DTYPE), mask=d_mask)
+
+def _pick_launch(max_query_len: int) -> tuple[int, int, int]:
+    """(BLOCK_M, num_warps, num_stages) for the attention kernels. BLOCK_M is
+    kept small because the [BLOCK_M, BLOCK_D] integer wv accumulator dominates
+    register pressure; decode (one query row) uses 16, the tl.dot minimum."""
+    if max_query_len <= 1:
+        return 16, 4, 2
+    return 32, 8, 2
 
 
 def _pick_num_splits(
-    max_query_len: int,
     requested: int,
     num_requests: int,
+    num_q_blocks: int,
     num_heads: int,
     device: torch.device,
 ) -> int:
-    if max_query_len > 1:
-        return 1
+    # Explicit override wins (tests and VLLM_FXP_NUM_KV_SPLITS rely on this).
     if requested >= 1:
         return requested
-    props = torch.cuda.get_device_properties(device)
-    num_sms = props.multi_processor_count
-    total_mblocks = max(1, num_requests * num_heads)
-    return max(1, num_sms // total_mblocks)
+    # Uses only static quantities (batch, q-blocks, heads, SM count), never
+    # tensor data, so it is safe under CUDA-graph capture. Small batches get
+    # more KV splits to fill the SMs; large batches already saturate them.
+    _, num_sms = _arch_info(device)
+    base = max(1, num_requests * num_q_blocks * num_heads)
+    return _next_pow2(max(1, (num_sms * _SPLIT_OCCUPANCY) // base))
 
 
 def unified_attention_fxp_run(
@@ -466,6 +710,7 @@ def unified_attention_fxp_run(
     if alibi_slopes is not None and alibi_slopes.numel() > 0:
         if alibi_slopes.dtype != torch.float32:
             raise TypeError("alibi_slopes must be float32")
+    _check_arch(q.dtype, q.device)
 
     k_cache = kv_cache.select(1, 0)
     v_cache = kv_cache.select(1, 1)
@@ -492,15 +737,79 @@ def unified_attention_fxp_run(
         # Triton wants a real tensor; only read under HAS_ALIBI.
         alibi = q
 
+    block_m, num_warps, num_stages = _pick_launch(int(max_query_len))
+    block_n = _BLOCK_N_BY_DTYPE[q.dtype]
+    block_d = max(_next_pow2(head_dim), 16)
+    num_q_blocks = max(1, triton.cdiv(max(1, int(max_query_len)), block_m))
+
     effective_splits = _pick_num_splits(
-        int(max_query_len), int(num_kv_splits), int(num_requests), int(num_heads), q.device
+        int(num_kv_splits), int(num_requests), int(num_q_blocks),
+        int(num_heads), q.device,
     )
 
     scale, inv_scale, qmin, qmax, tl_int_dtype, torch_int_dtype = fxp_constants(
         int(fxp_int_bits), int(fxp_frac_bits)
     )
     io_dtype = _TORCH_TO_TL_FLOAT[q.dtype]
+    allow_tf32 = q.dtype == torch.float32
 
+    has_softcap = float(logit_softcap) > 0.0
+    has_window = int(window_size) > 0
+
+    # Fast path: one split, so a single fused kernel owns each tile's whole key
+    # range and does both passes with no scratch or atomics. This is the path
+    # prefill takes.
+    if effective_splits == 1:
+        grid = (num_requests, num_q_blocks, num_heads)
+        _attn_fused_kernel[grid](
+            q,
+            k_cache,
+            v_cache,
+            o,
+            query_start_loc,
+            seq_lens,
+            block_table,
+            alibi,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            int(window_size),
+            q.stride(0),
+            q.stride(1),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            o.stride(0),
+            o.stride(1),
+            block_table.stride(0),
+            ss_log2,
+            softcap_log2,
+            SCALE=scale,
+            INV_SCALE=inv_scale,
+            QMIN=qmin,
+            QMAX=qmax,
+            INT_DTYPE=tl_int_dtype,
+            IO_DTYPE=io_dtype,
+            ALLOW_TF32=allow_tf32,
+            HAS_ALIBI=has_alibi,
+            HAS_SOFTCAP=has_softcap,
+            IS_CAUSAL=bool(is_causal),
+            HAS_WINDOW=has_window,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_D=block_d,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return
+
+    # Split path (num_splits > 1): two kernels with an integer atomic-add
+    # combine. split_dv atomic-adds each split into per-(token, head) totals;
+    # lock is the per-(token, head) arrival counter for the fused combine.
     T_total = q.shape[0]
     partial_max = torch.full(
         (T_total, num_heads, effective_splits),
@@ -508,27 +817,19 @@ def unified_attention_fxp_run(
         device=q.device,
         dtype=torch.float32,
     )
-    partial_denom = torch.zeros(
-        (T_total, num_heads, effective_splits),
-        device=q.device,
-        dtype=torch_int_dtype,
+    total_denom = torch.zeros(
+        (T_total, num_heads), device=q.device, dtype=torch_int_dtype
     )
-    partial_wv = torch.zeros(
-        (T_total, num_heads, effective_splits, head_dim),
-        device=q.device,
-        dtype=torch_int_dtype,
+    total_wv = torch.zeros(
+        (T_total, num_heads, head_dim), device=q.device, dtype=torch_int_dtype
     )
+    locks = torch.zeros((T_total, num_heads), device=q.device, dtype=torch.int32)
 
-    block_d = max(_next_pow2(head_dim), 16)
     block_s = max(_next_pow2(effective_splits), 1)
 
-    has_softcap = float(logit_softcap) > 0.0
-    has_window = int(window_size) > 0
+    grid = (num_requests, num_q_blocks, num_heads * effective_splits)
 
-    grid_split = (num_requests, max(1, int(max_query_len)), num_heads * effective_splits)
-    grid_combine = (num_requests, max(1, int(max_query_len)), num_heads)
-
-    _attn_split_max_kernel[grid_split](
+    _attn_split_max_kernel[grid](
         q,
         k_cache,
         partial_max,
@@ -553,25 +854,27 @@ def unified_attention_fxp_run(
         block_table.stride(0),
         ss_log2,
         softcap_log2,
-        SCALE=scale,
-        INV_SCALE=inv_scale,
-        QMIN=qmin,
-        QMAX=qmax,
-        INT_DTYPE=tl_int_dtype,
+        ALLOW_TF32=allow_tf32,
         HAS_ALIBI=has_alibi,
         HAS_SOFTCAP=has_softcap,
         IS_CAUSAL=bool(is_causal),
         HAS_WINDOW=has_window,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         BLOCK_D=block_d,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
-    _attn_split_dv_kernel[grid_split](
+    _attn_split_dv_kernel[grid](
         q,
         k_cache,
         v_cache,
         partial_max,
-        partial_denom,
-        partial_wv,
+        total_denom,
+        total_wv,
+        locks,
+        o,
         query_start_loc,
         seq_lens,
         block_table,
@@ -593,13 +896,15 @@ def unified_attention_fxp_run(
         partial_max.stride(0),
         partial_max.stride(1),
         partial_max.stride(2),
-        partial_denom.stride(0),
-        partial_denom.stride(1),
-        partial_denom.stride(2),
-        partial_wv.stride(0),
-        partial_wv.stride(1),
-        partial_wv.stride(2),
-        partial_wv.stride(3),
+        total_denom.stride(0),
+        total_denom.stride(1),
+        total_wv.stride(0),
+        total_wv.stride(1),
+        total_wv.stride(2),
+        locks.stride(0),
+        locks.stride(1),
+        o.stride(0),
+        o.stride(1),
         block_table.stride(0),
         ss_log2,
         softcap_log2,
@@ -608,34 +913,16 @@ def unified_attention_fxp_run(
         QMIN=qmin,
         QMAX=qmax,
         INT_DTYPE=tl_int_dtype,
+        IO_DTYPE=io_dtype,
+        ALLOW_TF32=allow_tf32,
         HAS_ALIBI=has_alibi,
         HAS_SOFTCAP=has_softcap,
         IS_CAUSAL=bool(is_causal),
         HAS_WINDOW=has_window,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         BLOCK_D=block_d,
         BLOCK_S=block_s,
-    )
-
-    _attn_combine_kernel[grid_combine](
-        partial_denom,
-        partial_wv,
-        o,
-        query_start_loc,
-        num_heads,
-        head_dim,
-        effective_splits,
-        partial_denom.stride(0),
-        partial_denom.stride(1),
-        partial_denom.stride(2),
-        partial_wv.stride(0),
-        partial_wv.stride(1),
-        partial_wv.stride(2),
-        partial_wv.stride(3),
-        o.stride(0),
-        o.stride(1),
-        INV_SCALE=inv_scale,
-        INT_DTYPE=tl_int_dtype,
-        IO_DTYPE=io_dtype,
-        BLOCK_D=block_d,
-        BLOCK_S=block_s,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )

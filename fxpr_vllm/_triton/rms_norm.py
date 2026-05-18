@@ -1,9 +1,8 @@
 """Batch-invariant RMSNorm: one Triton program per row, chunked over hidden.
 
-The grid is (batch,) and the kernel never specialises on batch size, so every
-row reduces in the same order no matter how many are launched. That fixed
-order is the whole point. The sum stays in fp32; fixed-point x*x overflowed on
-real residual-stream activations.
+The grid is (batch,) and the kernel never specialises on batch size, so rows
+reduce in a fixed order regardless of how many launch. The sum stays in fp32;
+a fixed-point x*x overflowed on real residual-stream activations.
 """
 
 from __future__ import annotations

@@ -89,7 +89,7 @@ def prefill_fxp_test(
     alibi_slopes: torch.Tensor | None = None,
     is_causal: bool = True,
     softmax_scale: float | None = None,
-    num_kv_splits: int = 8,
+    num_kv_splits: int = 1,
     fxp_int_bits: int = 32,
     fxp_frac_bits: int = DEFAULT_FXP_FRAC_BITS,
 ) -> None:

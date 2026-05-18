@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 DEFAULT_FXP_INT_BITS = 32
 DEFAULT_FXP_FRAC_BITS = 16
-DEFAULT_NUM_KV_SPLITS = 8
+DEFAULT_NUM_KV_SPLITS = 0 # means auto split
 
 logger = logging.getLogger("fxpr_vllm")
 
@@ -45,9 +45,10 @@ def load_runtime_config() -> FxpRuntimeConfig:
         )
         frac_bits = DEFAULT_FXP_FRAC_BITS
     num_kv_splits = _env_int("VLLM_FXP_NUM_KV_SPLITS", DEFAULT_NUM_KV_SPLITS)
-    if num_kv_splits < 1:
+    if num_kv_splits < 0:
         logger.warning(
-            "Invalid VLLM_FXP_NUM_KV_SPLITS=%d; must be >= 1. Using default %d.",
+            "Invalid VLLM_FXP_NUM_KV_SPLITS=%d; must be >= 0 (0 = auto). "
+            "Using default %d.",
             num_kv_splits,
             DEFAULT_NUM_KV_SPLITS,
         )

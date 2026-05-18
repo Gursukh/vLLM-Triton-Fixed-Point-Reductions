@@ -1,7 +1,22 @@
 import pytest
 import torch
 
-from tests.fixed_point_helpers import prefill_fxp_test, requires_cuda
+from tests.fixed_point_helpers import (
+    prefill_fxp_test,
+    requires_cuda,
+    skip_if_dtype_unsupported,
+)
+
+_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+
+_PREFILL_SEQ_LEN = 32
+_PREFILL_HEADS = 2
+_PREFILL_KV_HEADS = 2
+_PREFILL_HEAD_DIM = 32
+_PREFILL_SM_SCALE = 1.0 / (_PREFILL_HEAD_DIM**0.5)
+# >= every dtype's kernel BLOCK_N (64 fp16/bf16, 32 fp32) and a multiple of each,
+# so permuting a block of this size permutes whole kernel K-tiles.
+_PERM_BLOCK = 64
 
 
 def _ref_attention(
@@ -55,36 +70,42 @@ def _make_inputs(batch, seq_lens, num_heads, num_kv_heads, head_dim, seed=42):
     b_seq_len = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
     b_start_loc = torch.zeros(batch, device="cuda", dtype=torch.int32)
     b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], dim=0)
-
-    o = torch.empty_like(q)
-    return q, k, v, o, b_start_loc, b_seq_len
+    return q, k, v, b_start_loc, b_seq_len
 
 
-_PREFILL_SEQ_LEN = 32
-_PREFILL_HEADS = 2
-_PREFILL_KV_HEADS = 2
-_PREFILL_HEAD_DIM = 32
-_PREFILL_SM_SCALE = 1.0 / (_PREFILL_HEAD_DIM**0.5)
-
-
-@requires_cuda
-@pytest.mark.parametrize("batch", [1, 2])
-def test_prefill_correctness_causal(batch):
-    seq_lens = [_PREFILL_SEQ_LEN] * batch
-    q, k, v, o, b_start_loc, b_seq_len = _make_inputs(
-        batch, seq_lens, _PREFILL_HEADS, _PREFILL_KV_HEADS, _PREFILL_HEAD_DIM
-    )
-
+def _run_prefill(
+    q, k, v, b_start_loc, b_seq_len, max_input_len, dtype,
+    *, is_causal=True, num_kv_splits=1,
+):
+    """Cast fp32 inputs to `dtype`, run the kernel, return fp32 output."""
+    o = torch.empty(q.shape, device="cuda", dtype=dtype)
     prefill_fxp_test(
-        q,
-        k,
-        v,
+        q.to(dtype),
+        k.to(dtype),
+        v.to(dtype),
         o,
         b_start_loc,
         b_seq_len,
-        max_input_len=_PREFILL_SEQ_LEN,
-        is_causal=True,
+        max_input_len=max_input_len,
+        is_causal=is_causal,
         softmax_scale=_PREFILL_SM_SCALE,
+        num_kv_splits=num_kv_splits,
+    )
+    return o.float()
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("batch", [1, 2])
+def test_prefill_correctness_causal(dtype, batch):
+    skip_if_dtype_unsupported(dtype)
+    seq_lens = [_PREFILL_SEQ_LEN] * batch
+    q, k, v, b_start_loc, b_seq_len = _make_inputs(
+        batch, seq_lens, _PREFILL_HEADS, _PREFILL_KV_HEADS, _PREFILL_HEAD_DIM
+    )
+
+    o = _run_prefill(
+        q, k, v, b_start_loc, b_seq_len, _PREFILL_SEQ_LEN, dtype, is_causal=True
     )
     ref = _ref_attention(
         q, k, v, b_start_loc, b_seq_len, is_causal=True, sm_scale=_PREFILL_SM_SCALE
@@ -92,25 +113,19 @@ def test_prefill_correctness_causal(batch):
 
     assert torch.allclose(
         o, ref, atol=5e-2, rtol=5e-2
-    ), f"max error = {(o - ref).abs().max().item()}"
+    ), f"max error = {(o - ref).abs().max().item()} ({dtype})"
 
 
 @requires_cuda
-def test_prefill_correctness_non_causal():
-    q, k, v, o, b_start_loc, b_seq_len = _make_inputs(
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_prefill_correctness_non_causal(dtype):
+    skip_if_dtype_unsupported(dtype)
+    q, k, v, b_start_loc, b_seq_len = _make_inputs(
         1, [_PREFILL_SEQ_LEN], _PREFILL_HEADS, _PREFILL_KV_HEADS, _PREFILL_HEAD_DIM
     )
 
-    prefill_fxp_test(
-        q,
-        k,
-        v,
-        o,
-        b_start_loc,
-        b_seq_len,
-        max_input_len=_PREFILL_SEQ_LEN,
-        is_causal=False,
-        softmax_scale=_PREFILL_SM_SCALE,
+    o = _run_prefill(
+        q, k, v, b_start_loc, b_seq_len, _PREFILL_SEQ_LEN, dtype, is_causal=False
     )
     ref = _ref_attention(
         q, k, v, b_start_loc, b_seq_len, is_causal=False, sm_scale=_PREFILL_SM_SCALE
@@ -118,26 +133,22 @@ def test_prefill_correctness_non_causal():
 
     assert torch.allclose(
         o, ref, atol=5e-2, rtol=5e-2
-    ), f"max error = {(o - ref).abs().max().item()}"
+    ), f"max error = {(o - ref).abs().max().item()} ({dtype})"
 
 
 @requires_cuda
-def test_prefill_variable_seq_lens():
-    seq_lens = [_PREFILL_SEQ_LEN // 2, _PREFILL_SEQ_LEN, _PREFILL_SEQ_LEN * 3 // 4]
-    q, k, v, o, b_start_loc, b_seq_len = _make_inputs(
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_prefill_variable_seq_lens(dtype):
+    skip_if_dtype_unsupported(dtype)
+    # Lengths that are not multiples of BLOCK_M / BLOCK_N exercise the ragged
+    # query-block and key-tile masking.
+    seq_lens = [70, 128, 100]
+    q, k, v, b_start_loc, b_seq_len = _make_inputs(
         3, seq_lens, _PREFILL_HEADS, _PREFILL_KV_HEADS, _PREFILL_HEAD_DIM, seed=99
     )
 
-    prefill_fxp_test(
-        q,
-        k,
-        v,
-        o,
-        b_start_loc,
-        b_seq_len,
-        max_input_len=max(seq_lens),
-        is_causal=True,
-        softmax_scale=_PREFILL_SM_SCALE,
+    o = _run_prefill(
+        q, k, v, b_start_loc, b_seq_len, max(seq_lens), dtype, is_causal=True
     )
     ref = _ref_attention(
         q, k, v, b_start_loc, b_seq_len, is_causal=True, sm_scale=_PREFILL_SM_SCALE
@@ -145,7 +156,34 @@ def test_prefill_variable_seq_lens():
 
     assert torch.allclose(
         o, ref, atol=5e-2, rtol=5e-2
-    ), f"max error = {(o - ref).abs().max().item()}"
+    ), f"max error = {(o - ref).abs().max().item()} ({dtype})"
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("num_kv_splits", [1, 2, 4, 8])
+def test_prefill_invariant_across_kv_splits(dtype, num_kv_splits):
+    skip_if_dtype_unsupported(dtype)
+    # num_kv_splits=1 takes the fused single-kernel path; >1 takes the
+    # two-kernel atomic-add split path. Both must be bit-identical.
+    seq_lens = [96, 64]
+    q, k, v, b_start_loc, b_seq_len = _make_inputs(
+        2, seq_lens, _PREFILL_HEADS, _PREFILL_KV_HEADS, _PREFILL_HEAD_DIM, seed=5
+    )
+
+    o_ref = _run_prefill(
+        q, k, v, b_start_loc, b_seq_len, max(seq_lens), dtype,
+        is_causal=True, num_kv_splits=1,
+    )
+    o_got = _run_prefill(
+        q, k, v, b_start_loc, b_seq_len, max(seq_lens), dtype,
+        is_causal=True, num_kv_splits=num_kv_splits,
+    )
+
+    assert torch.equal(o_ref, o_got), (
+        f"prefill diverged at num_kv_splits={num_kv_splits} ({dtype}), "
+        f"max diff = {(o_ref - o_got).abs().max().item()}"
+    )
 
 
 def _float_attention_row(
@@ -208,8 +246,14 @@ def test_float_accumulation_is_order_dependent():
 
 
 @requires_cuda
-def test_fixedpoint_prefill_is_permutation_equivariant():
-    seq_len = _PREFILL_SEQ_LEN
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_fixedpoint_prefill_is_tile_permutation_invariant(dtype):
+    skip_if_dtype_unsupported(dtype)
+    # Permuting whole BLOCK_N-aligned KV tiles is bit-exact: each tile's tl.dot
+    # contracts the same keys in the same order, and the cross-tile reduction
+    # is an integer sum. Element-level permutation is NOT invariant — same
+    # determinism contract as gemm's K-tile permutation.
+    seq_len = 3 * _PERM_BLOCK
     g = torch.Generator(device="cuda").manual_seed(7)
     shape = (seq_len, _PREFILL_HEADS, _PREFILL_HEAD_DIM)
     q = torch.randn(shape, device="cuda", dtype=torch.float32, generator=g) * 0.5
@@ -219,42 +263,31 @@ def test_fixedpoint_prefill_is_permutation_equivariant():
     b_seq_len = torch.tensor([seq_len], device="cuda", dtype=torch.int32)
     b_start_loc = torch.tensor([0], device="cuda", dtype=torch.int32)
 
-    o_orig = torch.empty_like(q)
-    prefill_fxp_test(
-        q,
-        k,
-        v,
-        o_orig,
-        b_start_loc,
-        b_seq_len,
-        max_input_len=seq_len,
-        is_causal=False,
-        softmax_scale=_PREFILL_SM_SCALE,
+    o_orig = _run_prefill(
+        q, k, v, b_start_loc, b_seq_len, seq_len, dtype, is_causal=False
     )
 
-    perm = torch.randperm(seq_len, device="cuda")
-    o_perm = torch.empty_like(q)
-    prefill_fxp_test(
-        q,
-        k[perm],
-        v[perm],
-        o_perm,
-        b_start_loc,
-        b_seq_len,
-        max_input_len=seq_len,
-        is_causal=False,
-        softmax_scale=_PREFILL_SM_SCALE,
+    n_tiles = seq_len // _PERM_BLOCK
+    tile_perm = torch.randperm(n_tiles, device="cuda")
+    idx = torch.cat([
+        torch.arange(t * _PERM_BLOCK, (t + 1) * _PERM_BLOCK, device="cuda")
+        for t in tile_perm
+    ])
+    o_perm = _run_prefill(
+        q, k[idx], v[idx], b_start_loc, b_seq_len, seq_len, dtype, is_causal=False
     )
 
     assert torch.equal(o_orig, o_perm), (
-        f"fxp prefill should be KV-permutation invariant, "
+        f"fxp prefill should be KV-tile-permutation invariant ({dtype}), "
         f"max diff = {(o_orig - o_perm).abs().max().item()}"
     )
 
 
 @requires_cuda
-def test_prefill_deterministic_across_runs():
-    q, k, v, _, b_start_loc, b_seq_len = _make_inputs(
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_prefill_deterministic_across_runs(dtype):
+    skip_if_dtype_unsupported(dtype)
+    q, k, v, b_start_loc, b_seq_len = _make_inputs(
         1,
         [_PREFILL_SEQ_LEN],
         _PREFILL_HEADS,
@@ -263,23 +296,13 @@ def test_prefill_deterministic_across_runs():
         seed=77,
     )
 
-    results = []
-    for _ in range(5):
-        o = torch.empty_like(q)
-        prefill_fxp_test(
-            q,
-            k,
-            v,
-            o,
-            b_start_loc,
-            b_seq_len,
-            max_input_len=_PREFILL_SEQ_LEN,
-            is_causal=True,
-            softmax_scale=_PREFILL_SM_SCALE,
+    results = [
+        _run_prefill(
+            q, k, v, b_start_loc, b_seq_len, _PREFILL_SEQ_LEN, dtype, is_causal=True
         )
-        results.append(o)
-
+        for _ in range(5)
+    ]
     for r in results[1:]:
         assert torch.equal(
             results[0], r
-        ), f"Non-deterministic: max diff = {(results[0] - r).abs().max().item()}"
+        ), f"Non-deterministic ({dtype}): max diff = {(results[0] - r).abs().max().item()}"

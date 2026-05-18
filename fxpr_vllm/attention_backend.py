@@ -173,6 +173,23 @@ class DeterministicAttentionImpl(AttentionImpl):
             raise NotImplementedError(
                 "DeterministicAttention does not support fp8/quantized output scales."
             )
+
+        # Pre-compile the attention kernels on the first forward so real
+        # requests don't pay a JIT spike. No-op after the first call.
+        from .warmup import warmup_attention
+
+        warmup_attention(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            kv_cache.dtype,
+            query.device,
+            self.window_size,
+            self.logits_soft_cap,
+            self.fxp_int_bits,
+            self.fxp_frac_bits,
+        )
+
         num_tokens = query.shape[0]
 
         query = query.view(num_tokens, self.num_heads, self.head_size)
@@ -197,8 +214,13 @@ class DeterministicAttentionImpl(AttentionImpl):
         if self.alibi_slopes is not None and self.alibi_slopes.device != query.device:
             self.alibi_slopes = self.alibi_slopes.to(query.device)
 
-        query_start_loc = attn_metadata.query_start_loc.to(torch.int32)
-        seq_lens = attn_metadata.seq_lens.to(torch.int32)
+        # Skip the .to() dispatch when already int32 (forward() runs per layer).
+        query_start_loc = attn_metadata.query_start_loc
+        if query_start_loc.dtype != torch.int32:
+            query_start_loc = query_start_loc.to(torch.int32)
+        seq_lens = attn_metadata.seq_lens
+        if seq_lens.dtype != torch.int32:
+            seq_lens = seq_lens.to(torch.int32)
         block_table = attn_metadata.block_table
         max_query_len = int(attn_metadata.max_query_len)
 

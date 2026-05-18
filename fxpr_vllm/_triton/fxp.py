@@ -1,9 +1,8 @@
 """Float <-> signed fixed-point helpers shared by every kernel.
 
-float_to_fixed fuses (x * SCALE) → round-half-to-even → clamp → cast into the
-PTX `cvt.rni.sat.<dst>.f32` instruction for int16/int32 (`.sat` is built in),
-and falls back to a float-space clamp + `cvt.rni.s64.f32` for int64 (PTX has
-no `.sat` modifier for that conversion).
+float_to_fixed fuses scale, round-half-to-even, clamp and cast into one PTX
+cvt.rni.sat instruction for int16/int32, with a float-space-clamp fallback for
+int64 (which has no .sat modifier).
 """
 
 from __future__ import annotations
@@ -113,12 +112,9 @@ def fxp_rescale(
     QMAX: tl.constexpr,
     INT_DTYPE: tl.constexpr,
 ):
-    """Multiply a fxp-scale integer by an fp32 alpha (typically in [0, 1])
-    and round back to int. Used by online-softmax accumulator rescales.
-
-    The accumulator is already at the fxp scale, so unlike float_to_fixed
-    we don't multiply by SCALE — just apply alpha, clamp, and round.
-    """
+    """Multiply a fxp-scale integer by an fp32 alpha and round back to int,
+    for online-softmax accumulator rescales. The accumulator is already
+    scaled, so unlike float_to_fixed this skips the SCALE multiply."""
     scaled = acc_int.to(tl.float32) * alpha
     if INT_DTYPE == tl.int32:
         return _cvt_rni_sat_s32_f32(scaled)
