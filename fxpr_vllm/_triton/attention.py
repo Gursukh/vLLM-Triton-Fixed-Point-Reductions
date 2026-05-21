@@ -1,8 +1,9 @@
 """Unified prefill + decode attention over paged KV, tensor-core tiled.
-A fused kernel for num_splits == 1, a two-kernel split path otherwise. tl.dot
-does the within-tile QK^T and P*V; cross-tile reductions stay integer
-fixed-point sums, so the result is batch-invariant. softmax_scale is pre-scaled
-by 1/ln(2) for log2-space exp2.
+
+Fused kernel when num_splits == 1, else a two-kernel split path. tl.dot does the
+within-tile QK^T and P*V; cross-tile reductions stay integer fixed-point sums,
+so the result is batch-invariant. softmax_scale is pre-scaled by 1/ln(2) for
+log2-space exp2.
 """
 
 from __future__ import annotations
@@ -26,16 +27,15 @@ _TORCH_TO_TL_FLOAT = {
     torch.bfloat16: tl.bfloat16,
 }
 
-# Key-tile width = the determinism granularity (mirrors gemm's _BLOCK_K_BY_DTYPE).
-# Fixed per dtype: splits and causal edges are BLOCK_N-aligned so a tl.dot tile
-# always contracts the same keys in the same order.
+# Key-tile width = determinism granularity. Fixed per dtype; splits and causal
+# edges are BLOCK_N-aligned so a tl.dot tile always contracts the same keys.
 _BLOCK_N_BY_DTYPE = {
     torch.float16: 64,
     torch.bfloat16: 64,
     torch.float32: 32,
 }
 
-_SPLIT_OCCUPANCY = 2  # allow ~2 split programs per SM for latency hiding
+_SPLIT_OCCUPANCY = 2  # ~2 split programs per SM for latency hiding
 
 
 def _next_pow2(n: int) -> int:
@@ -44,8 +44,7 @@ def _next_pow2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
-# Cached (compute_capability, SM count) per device; the launcher runs per
-# layer, so re-querying the device every call is wasted host time.
+# Cache (compute_capability, SM count) per device; launcher runs per layer.
 _ARCH_CACHE: dict[int, tuple[int, int]] = {}
 
 
@@ -77,9 +76,9 @@ def _check_arch(dtype: torch.dtype, device: torch.device) -> None:
 
 @triton.jit
 def _split_tile_range(lo, hi, num_splits, split_index, BLOCK_N: tl.constexpr):
-    """BLOCK_N-aligned key range owned by `split_index`. Whole tiles are
-    dealt evenly across splits; boundaries do not depend on num_splits, so
-    the integer partials are split-invariant."""
+    """BLOCK_N-aligned key range owned by split_index. Whole tiles dealt evenly
+    across splits; boundaries don't depend on num_splits, so partials are
+    split-invariant."""
     total = hi - lo
     n_tiles = tl.maximum(tl.cdiv(total, BLOCK_N), 0)
     per_split = tl.cdiv(n_tiles, num_splits)
@@ -101,7 +100,7 @@ def _qk_post(
     HAS_SOFTCAP: tl.constexpr,
     HAS_ALIBI: tl.constexpr,
 ):
-    """Scale / softcap / alibi a [BLOCK_M, BLOCK_N] raw-qk score tile."""
+    """Scale/softcap/alibi a [BLOCK_M, BLOCK_N] raw-qk score tile."""
     scores = scores * softmax_scale_log2
     if HAS_SOFTCAP:
         scores = softcap_log2 * libdevice.tanh(scores / softcap_log2)
@@ -112,8 +111,8 @@ def _qk_post(
     return scores
 
 
-# do_not_specialize stride_block_table_row: it depends on max_model_len, so
-# warmup and real requests differ, forcing a recompile. It only offsets a small
+# do_not_specialize stride_block_table_row: depends on max_model_len, so warmup
+# and real requests differ and would force a recompile. It only offsets a small
 # int32 gather, so specializing it buys nothing.
 @triton.jit(
     do_not_specialize=["stride_block_table_row"],
@@ -162,9 +161,9 @@ def _attn_fused_kernel(
     BLOCK_D: tl.constexpr,
 ):
     """Single-kernel attention for num_splits == 1. One program owns its
-    (req, q_block, head) key range and runs both passes (row-max, then
-    denominator + weighted-V) as two K-loops, with no scratch or atomics.
-    Integer accumulators keep it bit-identical to the split path."""
+    (req, q_block, head) key range and runs both passes (row-max, then denom +
+    weighted-V) as two K-loops, no scratch or atomics. Integer accumulators keep
+    it bit-identical to the split path."""
     req = tl.program_id(axis=0)
     q_block = tl.program_id(axis=1)
     head_index = tl.program_id(axis=2)
@@ -221,7 +220,7 @@ def _attn_fused_kernel(
     q_tile = tl.load(q_ptrs, mask=row_valid[:, None] & d_mask[None, :], other=0.0)
     bt_row = block_table_ptr + req * stride_block_table_row
 
-    # Pass 1: per-row max over the whole key range.
+    # Pass 1: per-row max over the key range.
     row_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     for kn in range(lo, hi, BLOCK_N):
         n_off = kn + tl.arange(0, BLOCK_N)
@@ -247,7 +246,7 @@ def _attn_fused_kernel(
     # Invalid rows have no key; pin to 0 so exp2 gives 0, not nan.
     global_max = tl.where(row_valid, row_max, 0.0)
 
-    # Pass 2: integer-accumulate the denominator and weighted-V.
+    # Pass 2: integer-accumulate denom and weighted-V.
     denom_acc = tl.zeros((BLOCK_M,), dtype=INT_DTYPE)
     wv_acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=INT_DTYPE)
     for kn in range(lo, hi, BLOCK_N):
@@ -292,7 +291,7 @@ def _attn_fused_kernel(
     tl.store(o_ptrs, out.to(IO_DTYPE), mask=row_valid[:, None] & d_mask[None, :])
 
 
-# See _attn_fused_kernel; num_splits is also excluded so the split count can't
+# See _attn_fused_kernel; num_splits also excluded so the split count can't
 # force a recompile (BLOCK_S still varies, but warmup covers it).
 @triton.jit(
     do_not_specialize=["stride_block_table_row", "num_splits"],
@@ -367,7 +366,7 @@ def _attn_split_max_kernel(
         lo = 0
     chunk_start, chunk_end = _split_tile_range(lo, hi, num_splits, split_index, BLOCK_N)
 
-    # Per-row key bounds for masking the ragged causal/window edge.
+    # Per-row bounds for masking the ragged causal/window edge.
     if IS_CAUSAL:
         key_end_row = q_abs_pos + 1
     else:
@@ -551,7 +550,7 @@ def _attn_split_dv_kernel(
     q_tile = tl.load(q_ptrs, mask=row_valid[:, None] & d_mask[None, :], other=0.0)
     bt_row = block_table_ptr + req * stride_block_table_row
 
-    # Fold the per-split row maxes from pass 1 into one global max per row.
+    # Fold the per-split row maxes from pass 1 into one max per row.
     s_off = tl.arange(0, BLOCK_S)
     s_mask = s_off < num_splits
     pm_ptrs = (
@@ -595,18 +594,18 @@ def _attn_split_dv_kernel(
         )
         scores = tl.where(valid, scores, -float("inf"))
 
-        # exp2 of a masked (-inf) score is exactly 0, so it does not contribute.
+        # exp2 of a masked (-inf) score is exactly 0, so it drops out.
         weight = libdevice.exp2(scores - global_max[:, None])
-        # Denominator: per-key quantize then integer-sum across the tile.
+        # Denom: per-key quantize then integer-sum across the tile.
         denom_acc += tl.sum(float_to_fixed(weight, SCALE, QMIN, QMAX, INT_DTYPE), axis=1)
-        # P*V via tl.dot in fp32 (fixed tile shape, so deterministic); the
-        # per-tile partial is quantized and the cross-tile sum stays integer.
+        # P*V via fp32 tl.dot (fixed tile shape -> deterministic); quantize the
+        # per-tile partial, cross-tile sum stays integer.
         pv = tl.dot(
             weight.to(IO_DTYPE), v_tile, allow_tf32=ALLOW_TF32, out_dtype=tl.float32
         )
         wv_acc += float_to_fixed(pv, SCALE, QMIN, QMAX, INT_DTYPE)
 
-    # Accumulate this split into the per-(token, head) integer totals. Integer
+    # Add this split into the per-(token, head) integer totals. Integer
     # atomic-add is commutative, so the cross-split reduction is order-free.
     td_ptrs = total_denom_ptr + q_token_idx * stride_td_token + head_index * stride_td_head
     tl.atomic_add(td_ptrs, denom_acc, mask=row_valid, sem="relaxed")
@@ -622,7 +621,7 @@ def _attn_split_dv_kernel(
 
     # Fused combine: the last split to arrive divides and writes O. The acq_rel
     # increment makes its loads see every split's atomic-add, so the result is
-    # the same regardless of arrival order.
+    # order-independent.
     lk_ptrs = lock_ptr + q_token_idx * stride_lock_token + head_index * stride_lock_head
     arrived = tl.atomic_add(
         lk_ptrs, tl.full((BLOCK_M,), 1, tl.int32), mask=row_valid, sem="acq_rel"
@@ -645,7 +644,7 @@ def _attn_split_dv_kernel(
 
 def _pick_launch(max_query_len: int) -> tuple[int, int, int]:
     """(BLOCK_M, num_warps, num_stages) for the attention kernels. BLOCK_M is
-    kept small because the [BLOCK_M, BLOCK_D] integer wv accumulator dominates
+    small because the [BLOCK_M, BLOCK_D] integer wv accumulator dominates
     register pressure; decode (one query row) uses 16, the tl.dot minimum."""
     if max_query_len <= 1:
         return 16, 4, 2
@@ -659,12 +658,11 @@ def _pick_num_splits(
     num_heads: int,
     device: torch.device,
 ) -> int:
-    # Explicit override wins (tests and VLLM_FXP_NUM_KV_SPLITS rely on this).
+    # Explicit override wins; tests pass requested >= 1 to force a split count.
     if requested >= 1:
         return requested
-    # Uses only static quantities (batch, q-blocks, heads, SM count), never
-    # tensor data, so it is safe under CUDA-graph capture. Small batches get
-    # more KV splits to fill the SMs; large batches already saturate them.
+    # Static-only inputs (batch, q-blocks, heads, SM count), so safe under
+    # CUDA-graph capture. Small batches get more splits to fill the SMs.
     _, num_sms = _arch_info(device)
     base = max(1, num_requests * num_q_blocks * num_heads)
     return _next_pow2(max(1, (num_sms * _SPLIT_OCCUPANCY) // base))
@@ -734,7 +732,7 @@ def unified_attention_fxp_run(
     if has_alibi:
         alibi = alibi_slopes.contiguous()
     else:
-        # Triton wants a real tensor; only read under HAS_ALIBI.
+        # Triton needs a real tensor; only read under HAS_ALIBI.
         alibi = q
 
     block_m, num_warps, num_stages = _pick_launch(int(max_query_len))
@@ -756,9 +754,8 @@ def unified_attention_fxp_run(
     has_softcap = float(logit_softcap) > 0.0
     has_window = int(window_size) > 0
 
-    # Fast path: one split, so a single fused kernel owns each tile's whole key
-    # range and does both passes with no scratch or atomics. This is the path
-    # prefill takes.
+    # Fast path: one split, so a single fused kernel owns each tile's full key
+    # range and does both passes with no scratch or atomics (prefill takes this).
     if effective_splits == 1:
         grid = (num_requests, num_q_blocks, num_heads)
         _attn_fused_kernel[grid](
@@ -808,8 +805,8 @@ def unified_attention_fxp_run(
         return
 
     # Split path (num_splits > 1): two kernels with an integer atomic-add
-    # combine. split_dv atomic-adds each split into per-(token, head) totals;
-    # lock is the per-(token, head) arrival counter for the fused combine.
+    # combine. split_dv adds each split into per-(token, head) totals; lock is
+    # the per-(token, head) arrival counter for the fused combine.
     T_total = q.shape[0]
     partial_max = torch.full(
         (T_total, num_heads, effective_splits),

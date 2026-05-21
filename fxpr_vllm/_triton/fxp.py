@@ -1,8 +1,7 @@
 """Float <-> signed fixed-point helpers shared by every kernel.
 
-float_to_fixed fuses scale, round-half-to-even, clamp and cast into one PTX
-cvt.rni.sat instruction for int16/int32, with a float-space-clamp fallback for
-int64 (which has no .sat modifier).
+float_to_fixed scales, rounds half-to-even, clamps and casts in one PTX
+cvt.rni.sat for int16/int32. int64 has no .sat, so it clamps in float first.
 """
 
 from __future__ import annotations
@@ -24,8 +23,16 @@ _TORCH_INT_DTYPE_BY_BITS = {
     64: torch.int64,
 }
 
+# Memoise (int_bits, frac_bits) -> derived constants; launchers call this once
+# per layer per step, so keep it off the CPU hot path.
+_CONSTANTS_CACHE: dict[tuple[int, int], tuple] = {}
+
 
 def fxp_constants(int_bits: int, frac_bits: int):
+    key = (int_bits, frac_bits)
+    cached = _CONSTANTS_CACHE.get(key)
+    if cached is not None:
+        return cached
     if int_bits not in _INT_DTYPE_BY_BITS:
         raise ValueError(f"int_bits must be 16/32/64, got {int_bits}")
     if not (0 <= frac_bits < 64):
@@ -34,7 +41,7 @@ def fxp_constants(int_bits: int, frac_bits: int):
     inv_scale = 1.0 / scale
     qmax_i = (1 << (int_bits - 1)) - 1
     qmin_i = -(1 << (int_bits - 1))
-    return (
+    result = (
         scale,
         inv_scale,
         float(qmin_i),
@@ -42,6 +49,8 @@ def fxp_constants(int_bits: int, frac_bits: int):
         _INT_DTYPE_BY_BITS[int_bits],
         _TORCH_INT_DTYPE_BY_BITS[int_bits],
     )
+    _CONSTANTS_CACHE[key] = result
+    return result
 
 
 @triton.jit
@@ -94,7 +103,7 @@ def float_to_fixed(
     elif INT_DTYPE == tl.int16:
         return _cvt_rni_sat_s16_f32(scaled)
     else:
-        # int64: no .sat variant for s64.f32, clamp in float space first.
+        # int64: no .sat for s64.f32, clamp in float first.
         clamped = tl.minimum(tl.maximum(scaled, QMIN), QMAX)
         return _cvt_rni_s64_f32(clamped)
 
@@ -112,9 +121,8 @@ def fxp_rescale(
     QMAX: tl.constexpr,
     INT_DTYPE: tl.constexpr,
 ):
-    """Multiply a fxp-scale integer by an fp32 alpha and round back to int,
-    for online-softmax accumulator rescales. The accumulator is already
-    scaled, so unlike float_to_fixed this skips the SCALE multiply."""
+    """Multiply an already-scaled fxp integer by fp32 alpha and round back to
+    int (online-softmax rescale). Skips the SCALE multiply float_to_fixed does."""
     scaled = acc_int.to(tl.float32) * alpha
     if INT_DTYPE == tl.int32:
         return _cvt_rni_sat_s32_f32(scaled)

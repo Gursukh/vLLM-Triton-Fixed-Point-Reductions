@@ -3,7 +3,7 @@ import torch
 
 import fxpr_vllm  # noqa: F401
 from fxpr_vllm.sampling import deterministic_log_softmax
-from tests.fixed_point_helpers import requires_cuda
+from .fixed_point_helpers import requires_cuda
 
 
 @requires_cuda

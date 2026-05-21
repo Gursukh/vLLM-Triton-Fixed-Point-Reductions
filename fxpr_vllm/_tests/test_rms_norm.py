@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import fxpr_vllm  # noqa: F401
-from tests.fixed_point_helpers import requires_cuda
+from .fixed_point_helpers import requires_cuda
 
 
 def _run_rms_norm_kernel(
@@ -42,7 +42,7 @@ def test_rms_norm_fixed_point_correctness(shape):
     batch, hidden = shape
     g = torch.Generator(device="cuda").manual_seed(0)
 
-    # Keep below Q16.16 saturation.
+    # Stay below Q16.16 saturation.
     x = (
         torch.rand((batch, hidden), device="cuda", dtype=torch.float32, generator=g)
         - 0.5
@@ -85,7 +85,7 @@ def test_rms_norm_native_dtype(dtype, shape):
     got = torch.ops.fxpr.rms_norm_fxp(x, w, 1e-6)
     assert got.dtype == dtype, f"output dtype {got.dtype} != input dtype {dtype}"
 
-    # Reference is fp32 + cast, matching the kernel's internals.
+    # Reference is fp32 then cast, matching the kernel.
     ref_f32 = _run_rms_norm_float_kernel(x.to(torch.float32), w.to(torch.float32), 1e-6)
     ref = ref_f32.to(dtype)
 
@@ -123,7 +123,7 @@ def test_rms_norm_residual_native_dtype(dtype):
     out = torch.ops.fxpr.rms_norm_fxp_residual(x, r, w, 1e-6)
     assert out.dtype == dtype
     assert r.dtype == dtype
-    # `r` is mutated in place to (x + r).
+    # r is mutated in place to (x + r).
     expected_r = (x.to(torch.float32) + r_orig.to(torch.float32)).to(dtype)
     atol, rtol = _DTYPE_TOL[dtype]
     assert torch.allclose(r.to(torch.float32), expected_r.to(torch.float32),
@@ -132,7 +132,7 @@ def test_rms_norm_residual_native_dtype(dtype):
 
 @requires_cuda
 def test_rms_norm_associativity_fixed_vs_float16():
-    # fp16 sum is order-dependent here; the fxp kernel must not be.
+    # fp16 sum is order-dependent here; fxp must not be.
     order_a = [64.0, 1.0, 1.0, 1.0, 1.0]
     order_b = [1.0, 1.0, 1.0, 1.0, 64.0]
 

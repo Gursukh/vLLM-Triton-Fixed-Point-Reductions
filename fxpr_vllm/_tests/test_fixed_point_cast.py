@@ -1,11 +1,11 @@
 import pytest
 import torch
-from tests.fixed_point_helpers import float_to_fixed, requires_cuda, fixed_to_float
+from .fixed_point_helpers import float_to_fixed, requires_cuda, fixed_to_float
 
 
 @requires_cuda
 def test_float_to_fixed_known_values():
-    # frac_bits=16 (FXPR_FRAC_BITS).
+    # frac_bits=16.
     x = torch.tensor(
         [
             0.0,
@@ -56,7 +56,7 @@ def test_float_to_fixed_saturation():
 
 @requires_cuda
 def test_float_roundtrip_lossless():
-    # All powers of 2, exact at frac_bits=16.
+    # Powers of 2 are exact at frac_bits=16.
     base = torch.tensor(
         [0.0, 1.0, -1.0, 0.5, -0.5, 0.25, 0.125, 2.0, -2.0, 10.0, -10.0],
         device="cuda",
@@ -69,7 +69,7 @@ def test_float_roundtrip_lossless():
 
 @requires_cuda
 def test_float_roundtrip_rounding():
-    # step=2^-16; off-grid inputs get rounded.
+    # step=2^-16; off-grid inputs round to the grid.
     frac_bits = 16
     step = 2**-frac_bits
     x = torch.tensor(
@@ -87,7 +87,7 @@ def test_float_roundtrip_rounding():
 
 @requires_cuda
 def test_fixed_roundtrip_lossless():
-    # Small ints round-trip through fp32 at frac_bits=16.
+    # Small ints round-trip through fp32.
     q = torch.tensor(
         [0, 1, -1, 123, -123, (1 << 20), -(1 << 20)], device="cuda", dtype=torch.int32
     )
@@ -99,9 +99,8 @@ def test_fixed_roundtrip_lossless():
 @requires_cuda
 @pytest.mark.parametrize("frac_bits", [8, 16, 32])
 def test_float_roundtrip_lossless_parametrized_frac_bits(frac_bits):
-    # Powers of 2 inside the representable range are exact at any frac_bits in
-    # {8, 16, 32}. Use int64 so the full set fits even at frac_bits=32 (where
-    # 1.0 -> 2^32 would saturate int32).
+    # Powers of 2 are exact at any frac_bits. Use int64 so 1.0 -> 2^32 fits
+    # at frac_bits=32 (would saturate int32).
     base = torch.tensor(
         [0.0, 1.0, -1.0, 0.5, -0.5, 0.25, 0.125],
         device="cuda",

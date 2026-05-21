@@ -22,7 +22,7 @@ def patch_rms_norm() -> int:
     if original_rms_norm is not DeterministicRMSNorm:
         layernorm_mod.RMSNorm = DeterministicRMSNorm
 
-    # Rebind models that already imported the original RMSNorm symbol.
+    # rebind models that already imported the original RMSNorm.
     patched = 0
     for mod_name, mod in list(sys.modules.items()):
         if mod is None or not mod_name.startswith("vllm.model_executor.models."):

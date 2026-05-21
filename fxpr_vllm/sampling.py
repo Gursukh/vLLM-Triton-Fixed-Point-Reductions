@@ -19,7 +19,7 @@ def deterministic_log_softmax(
     else:
         transposed = False
 
-    # downstream calls .numpy(), which rejects bf16/fp16.
+    # downstream .numpy() rejects bf16/fp16, so upcast.
     if logits.dtype != torch.float32:
         logits = logits.to(torch.float32)
 

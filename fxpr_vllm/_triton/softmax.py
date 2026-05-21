@@ -44,7 +44,7 @@ def _log_softmax_kernel(
     for off in range(0, N, BLOCK_N):
         cols = off + tl.arange(0, BLOCK_N)
         mask = cols < N
-        # -inf so tail lanes contribute exp(-inf) = 0 to the sum.
+        # -inf so tail lanes add exp(-inf) = 0 to the sum.
         xi = tl.load(x_row + cols, mask=mask, other=-float("inf")).to(tl.float32)
         ei = libdevice.exp(xi - row_max)
         sum_fxp += tl.sum(float_to_fixed(ei, SCALE, QMIN, QMAX, INT_DTYPE), axis=0)

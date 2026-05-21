@@ -19,7 +19,7 @@ from .config import get_runtime_config
 
 logger = logging.getLogger("fxpr_vllm")
 
-# Softmax is in log2 space; pre-scale alibi slopes by 1/ln(2).
+# softmax runs in log2 space, so scale alibi slopes by 1/ln(2).
 RCP_LN2 = 1.4426950408889634
 
 _flash_meta_cls: type[AttentionMetadata] | None = None
@@ -145,7 +145,6 @@ class DeterministicAttentionImpl(AttentionImpl):
         self.attn_type = attn_type
         self.fxp_int_bits = cfg.fxp_int_bits
         self.fxp_frac_bits = cfg.fxp_frac_bits
-        self.num_kv_splits = cfg.num_kv_splits
 
         if alibi_slopes is not None:
             slopes = torch.tensor(alibi_slopes, dtype=torch.float32) * RCP_LN2
@@ -174,8 +173,7 @@ class DeterministicAttentionImpl(AttentionImpl):
                 "DeterministicAttention does not support fp8/quantized output scales."
             )
 
-        # Pre-compile the attention kernels on the first forward so real
-        # requests don't pay a JIT spike. No-op after the first call.
+        # warm kernels on first forward so requests don't pay a JIT spike.
         from .warmup import warmup_attention
 
         warmup_attention(
@@ -214,7 +212,7 @@ class DeterministicAttentionImpl(AttentionImpl):
         if self.alibi_slopes is not None and self.alibi_slopes.device != query.device:
             self.alibi_slopes = self.alibi_slopes.to(query.device)
 
-        # Skip the .to() dispatch when already int32 (forward() runs per layer).
+        # avoid the .to() dispatch when already int32 (called per layer).
         query_start_loc = attn_metadata.query_start_loc
         if query_start_loc.dtype != torch.int32:
             query_start_loc = query_start_loc.to(torch.int32)
@@ -224,7 +222,7 @@ class DeterministicAttentionImpl(AttentionImpl):
         block_table = attn_metadata.block_table
         max_query_len = int(attn_metadata.max_query_len)
 
-        # Q/KV/output must share dtype.
+        # q, kv and output must share a dtype.
         if query.dtype != kv_cache.dtype:
             q_in = query.to(kv_cache.dtype)
         else:
@@ -247,7 +245,7 @@ class DeterministicAttentionImpl(AttentionImpl):
             int(self.fxp_frac_bits),
             float(self.logits_soft_cap),
             int(self.window_size),
-            int(self.num_kv_splits),
+            0,  # num_kv_splits=0: auto-pick the split count
         )
 
         return output.view(num_tokens, self.num_heads * self.head_size)

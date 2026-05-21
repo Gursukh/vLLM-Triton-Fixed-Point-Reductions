@@ -1,5 +1,5 @@
 import torch
-from tests.fixed_point_helpers import float_to_fixed, requires_cuda, fixed_to_float
+from .fixed_point_helpers import float_to_fixed, requires_cuda, fixed_to_float
 
 
 def assert_bitwise_equal_float32(a: torch.Tensor, b: torch.Tensor) -> None:
@@ -49,7 +49,7 @@ def ordered_fixed_sum_as_float(
 
 @requires_cuda
 def test_sum_on_q_grid_bitwise_identical():
-    # Q values that round-trip exactly at frac_bits=16.
+    # Q values that round-trip exactly.
     q_vals = torch.tensor(
         [0, 1, -1, 37, -53, 512, -1024, 4095, -777],
         device="cuda",
@@ -66,7 +66,7 @@ def test_sum_on_q_grid_bitwise_identical():
 
 @requires_cuda
 def test_sum_overflow_saturates_to_int32_max():
-    # |x| > 32768 saturates per-element at frac_bits=16, so the sum does too.
+    # |x| > 32768 saturates per-element, so the sum does too.
     x = torch.tensor(
         [float(1 << 14), float(1 << 14), 16.0],
         device="cuda",

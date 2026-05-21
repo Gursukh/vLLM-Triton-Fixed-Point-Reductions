@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import fxpr_vllm  # noqa: F401
-from tests.fixed_point_helpers import requires_cuda, skip_if_dtype_unsupported
+from .fixed_point_helpers import requires_cuda, skip_if_dtype_unsupported
 
 _NUM_HEADS = 4
 _NUM_KV_HEADS = 2
@@ -69,8 +69,7 @@ def _run_decode(q, kv_cache, query_start_loc, seq_lens, block_table, num_kv_spli
 @pytest.mark.parametrize("num_kv_splits", [1, 2, 4, 8])
 def test_decode_invariant_across_kv_splits(dtype, num_kv_splits):
     skip_if_dtype_unsupported(dtype)
-    # Sequences span several BLOCK_N key tiles so splitting really cuts the
-    # K range — not a single-tile no-op.
+    # Seqs span several BLOCK_N tiles so the split actually divides the K range.
     seq_lens = [160, 96]
     q, kv_cache, qsl, sl, bt = _build_decode_inputs(
         seq_lens, num_blocks_per_seq=10, dtype=dtype

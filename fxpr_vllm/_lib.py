@@ -1,4 +1,4 @@
-"""torch.ops.fxpr.* — schemas and CUDA impls dispatching to Triton."""
+"""torch.ops.fxpr.* schemas and CUDA impls (dispatch to Triton)."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ _lib = torch.library.Library("fxpr", "DEF")
 
 _lib.define("float_to_fixed(Tensor x, int int_bits, int fxp_frac_bits) -> Tensor")
 _lib.define("fixed_to_float(Tensor x, int float_bits, int fxp_frac_bits) -> Tensor")
-# rms_norm reduces in fp32 (see _triton/rms_norm.py), so it takes no bits.
+# rms_norm reduces in fp32, so no bit args.
 _lib.define("rms_norm_fxp(Tensor x, Tensor weight_fp32, float eps) -> Tensor")
 _lib.define(
     "rms_norm_fxp_residual(Tensor x, Tensor(a!) residual, Tensor weight_fp32, "

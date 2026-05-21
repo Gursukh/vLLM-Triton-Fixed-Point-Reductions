@@ -1,4 +1,4 @@
-"""Meta (fake) impls for Dynamo + torch.ops.fxpr.* aliases."""
+"""Fake impls for Dynamo, plus torch.ops.fxpr.* aliases."""
 
 from __future__ import annotations
 

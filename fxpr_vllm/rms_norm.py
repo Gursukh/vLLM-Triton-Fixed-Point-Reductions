@@ -12,7 +12,7 @@ class DeterministicRMSNorm(RMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # vLLM fused-residual API: returns (normalised, residual += x).
+        # fused-residual path: returns (normed, residual += x).
         if residual is not None:
             out = rms_norm_fxp_residual_op(
                 x, residual, self.weight, self.variance_epsilon
@@ -21,9 +21,7 @@ class DeterministicRMSNorm(RMSNorm):
 
         return rms_norm_fxp_op(x, self.weight, self.variance_epsilon)
 
-    # vLLM calls forward_cuda with custom ops enabled and forward_native
-    # without, and it disables them by default under torch.compile. Bind
-    # both so the FXPR kernel runs whichever path vLLM picks; binding only
-    # forward_cuda silently fell back to stock (batch-variant) RMSNorm.
+    # vLLM picks forward_native under torch.compile, forward_cuda otherwise.
+    # bind both, or it silently falls back to the batch-variant RMSNorm.
     forward_cuda = _forward_fxp
     forward_native = _forward_fxp

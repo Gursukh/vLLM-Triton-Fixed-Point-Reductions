@@ -14,9 +14,8 @@ _registered = False
 
 
 def register() -> None:
-    # No-op when FXPR_DISABLE_PATCHES=1. Lets us build a vanilla baseline LLM
-    # in the same process; vLLM otherwise auto-runs this from the
-    # vllm.general_plugins entry point on every construction.
+    # FXPR_DISABLE_PATCHES=1 skips patching so a vanilla baseline can run in the
+    # same process. vLLM auto-runs this via the vllm.general_plugins entry point.
     global _registered
     if os.environ.get("FXPR_DISABLE_PATCHES") == "1":
         logger.info("fxpr_vllm: FXPR_DISABLE_PATCHES=1 set; skipping registration")
@@ -29,9 +28,9 @@ def register() -> None:
 
     cfg = get_runtime_config()
     logger.info(
-        "Runtime Config: fxp_int_bits=%d num_kv_splits=%d",
+        "Runtime Config: fxp_int_bits=%d fxp_frac_bits=%d",
         cfg.fxp_int_bits,
-        cfg.num_kv_splits,
+        cfg.fxp_frac_bits,
     )
 
     from . import library_ops  # noqa: F401
