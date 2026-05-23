@@ -8,7 +8,6 @@ from ._triton import attention as _triton_attention
 from ._triton import casts as _triton_casts
 from ._triton import gemm as _triton_gemm
 from ._triton import rms_norm as _triton_rms_norm
-from ._triton import softmax as _triton_softmax
 
 
 _lib = torch.library.Library("fxpr", "DEF")
@@ -21,7 +20,6 @@ _lib.define(
     "rms_norm_fxp_residual(Tensor x, Tensor(a!) residual, Tensor weight_fp32, "
     "float eps) -> Tensor"
 )
-_lib.define("log_softmax_fxp(Tensor x, int fxp_int_bits, int fxp_frac_bits) -> Tensor")
 _lib.define(
     "gemm_fxp(Tensor a, Tensor b, Tensor? bias, int fxp_int_bits, "
     "int fxp_frac_bits) -> Tensor"
@@ -74,17 +72,6 @@ def _rms_norm_fxp_residual_cuda(
 ):
     return _triton_rms_norm.rms_norm_fxp_residual_run(
         x, residual, weight, float(eps)
-    )
-
-
-@torch.library.impl("fxpr::log_softmax_fxp", "CUDA", lib=_lib)
-def _log_softmax_fxp_cuda(
-    x: torch.Tensor, fxp_int_bits: int, fxp_frac_bits: int
-):
-    _check_int_bits(fxp_int_bits)
-    _check_frac_bits(fxp_frac_bits)
-    return _triton_softmax.log_softmax_fxp_run(
-        x, int(fxp_int_bits), int(fxp_frac_bits)
     )
 
 

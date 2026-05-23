@@ -53,16 +53,3 @@ def patch_attention_backend() -> None:
         f"{DeterministicAttentionBackend.__qualname__}"
     )
     register_backend(AttentionBackendEnum.CUSTOM, class_path=backend_path)
-
-
-def patch_sampler() -> None:
-    from vllm.v1.sample.sampler import Sampler
-
-    from .sampling import deterministic_log_softmax
-
-    if getattr(Sampler, "_fxp_logprobs_patched", False):
-        return
-
-    Sampler.compute_logprobs = staticmethod(deterministic_log_softmax)
-    Sampler._fxp_logprobs_patched = True
-    logger.info("Sampler log-softmax patched")

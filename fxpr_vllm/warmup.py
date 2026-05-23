@@ -14,7 +14,6 @@ logger = logging.getLogger("fxpr_vllm")
 _attn_warmed = False
 _gemm_warmed: set[tuple] = set()
 _rms_norm_warmed: set[tuple] = set()
-_log_softmax_warmed: set[tuple] = set()
 
 
 def warmup_attention(
@@ -122,24 +121,6 @@ def warmup_rms_norm(
         torch.cuda.synchronize(device)
     except Exception as e:  # noqa: BLE001
         logger.warning("fxpr rms_norm warmup skipped: %s", e)
-
-
-def warmup_log_softmax(
-    vocab_size: int, device: torch.device, int_bits: int, frac_bits: int,
-) -> None:
-    """Compile log_softmax. The caller upcasts to fp32, so one binary is enough."""
-    key = (vocab_size, int(int_bits), int(frac_bits))
-    if key in _log_softmax_warmed:
-        return
-    if torch.cuda.is_current_stream_capturing():
-        return
-    _log_softmax_warmed.add(key)
-    try:
-        x = torch.zeros(1, vocab_size, device=device, dtype=torch.float32)
-        torch.ops.fxpr.log_softmax_fxp(x, int(int_bits), int(frac_bits))
-        torch.cuda.synchronize(device)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("fxpr log_softmax warmup skipped: %s", e)
 
 
 def warmup_gemm(

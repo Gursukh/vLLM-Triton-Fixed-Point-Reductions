@@ -45,11 +45,6 @@ def _rms_norm_fxp_residual_fake(x, residual, weight_fp32, eps):
     return torch.empty_like(x)
 
 
-@torch.library.register_fake("fxpr::log_softmax_fxp")
-def _log_softmax_fxp_fake(x, fxp_int_bits, fxp_frac_bits):
-    return torch.empty_like(x)
-
-
 @torch.library.register_fake("fxpr::gemm_fxp")
 def _gemm_fxp_fake(a, b, bias, fxp_int_bits, fxp_frac_bits):
     return a.new_empty((a.shape[0], b.shape[1]))
@@ -79,6 +74,5 @@ def _unified_attention_fxp_fake(
 gemm_fxp = torch.ops.fxpr.gemm_fxp
 rms_norm_fxp = torch.ops.fxpr.rms_norm_fxp
 rms_norm_fxp_residual = torch.ops.fxpr.rms_norm_fxp_residual
-log_softmax_fxp = torch.ops.fxpr.log_softmax_fxp
 float_to_fixed = torch.ops.fxpr.float_to_fixed
 fixed_to_float = torch.ops.fxpr.fixed_to_float

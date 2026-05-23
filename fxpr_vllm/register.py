@@ -35,10 +35,11 @@ def register() -> None:
 
     from . import library_ops  # noqa: F401
 
+    # Native torch.log_softmax was verified batch-invariant on every GPU arch
+    # (isolated probe + MATH500 end-to-end), so the sampler is left unpatched.
     steps: list[tuple[str, Callable[[], object], Callable[[], None]]] = [
         ("RMSNorm", monkey_patches.patch_rms_norm, _undo_rms_norm),
         ("Attention", monkey_patches.patch_attention_backend, _noop),
-        ("Sampler", monkey_patches.patch_sampler, _undo_sampler),
     ]
 
     rollback: list[Callable[[], None]] = []
@@ -70,14 +71,3 @@ def _undo_rms_norm() -> None:
         op_registry.pop("rms_norm", None)
     except Exception as e:
         logger.warning("RMSNorm rollback failed: %s", e)
-
-
-def _undo_sampler() -> None:
-    try:
-        from vllm.v1.sample.sampler import Sampler
-
-        if getattr(Sampler, "_fxp_logprobs_patched", False):
-            del Sampler.compute_logprobs
-            Sampler._fxp_logprobs_patched = False
-    except Exception as e:
-        logger.warning("Sampler rollback failed: %s", e)

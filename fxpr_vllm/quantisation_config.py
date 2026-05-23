@@ -20,7 +20,7 @@ from vllm.model_executor.layers.quantization import register_quantization_config
 
 from .library_ops import gemm_fxp
 from .config import get_runtime_config
-from .warmup import warmup_gemm, warmup_log_softmax, warmup_rms_norm
+from .warmup import warmup_gemm, warmup_rms_norm
 
 
 @register_quantization_config("fixed_point_det")
@@ -171,13 +171,6 @@ class FixedPointEmbeddingMethod(QuantizeMethodBase):
 
         # warm gemm_fxp for the lm_head shape at load time.
         warmup_gemm(layer.weight_native, self.fxp_int_bits, self.fxp_frac_bits)
-        # log-softmax runs on (batch, vocab) and always upcasts to fp32, so one
-        # fp32 binary per vocab size covers it.
-        vocab = layer.weight_native.shape[1]
-        warmup_log_softmax(
-            vocab, layer.weight_native.device,
-            self.fxp_int_bits, self.fxp_frac_bits,
-        )
 
     def apply(
         self,
