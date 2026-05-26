@@ -16,14 +16,12 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.parameter import ModelWeightParameter
-from vllm.model_executor.layers.quantization import register_quantization_config
 
 from .library_ops import gemm_fxp
 from .config import get_runtime_config
 from .warmup import warmup_gemm, warmup_rms_norm
 
 
-@register_quantization_config("fixed_point_det")
 class FixedPointConfig(QuantizationConfig):
     def __init__(self) -> None:
         pass
@@ -60,8 +58,12 @@ class FixedPointConfig(QuantizationConfig):
             return FixedPointLinearMethod(self)
         # ParallelLMHead subclasses this. cuBLAS switches GEMV (M=1) vs GEMM
         # (M>=2), flipping tokens on Blackwell; gemm_fxp stays batch-invariant.
+        # Opt-in and off by default (mirrors FXPR_ENABLE_RMS_NORM); when unset
+        # the lm_head matmul falls back to vLLM's default method.
         if isinstance(layer, VocabParallelEmbedding):
-            return FixedPointEmbeddingMethod(self)
+            if get_runtime_config().enable_lm_head:
+                return FixedPointEmbeddingMethod(self)
+            return None
         return None
 
     def get_scaled_act_names(self) -> list[str]:

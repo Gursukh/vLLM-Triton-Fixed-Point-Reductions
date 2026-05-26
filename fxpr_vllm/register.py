@@ -1,73 +1,40 @@
 import logging
-import os
-from typing import Callable
 
 from .config import get_runtime_config
 
-from . import quantisation_config  # noqa: F401
-from . import monkey_patches
-
 logger = logging.getLogger("fxpr_vllm")
-
 
 _registered = False
 
 
 def register() -> None:
-    # FXPR_DISABLE_PATCHES=1 skips patching so a vanilla baseline can run in the
-    # same process. vLLM auto-runs this via the vllm.general_plugins entry point.
+    """vLLM plugin entry point; auto-called via vllm.general_plugins."""
     global _registered
-    if os.environ.get("FXPR_DISABLE_PATCHES") == "1":
-        logger.info("fxpr_vllm: FXPR_DISABLE_PATCHES=1 set; skipping registration")
-        return
     if _registered:
         return
-    _registered = True
-
-    logger.info("fxpr_vllm: registering components")
 
     cfg = get_runtime_config()
     logger.info(
-        "Runtime Config: fxp_int_bits=%d fxp_frac_bits=%d",
-        cfg.fxp_int_bits,
-        cfg.fxp_frac_bits,
+        "fxpr_vllm: int_bits=%d frac_bits=%d rms_norm=%s lm_head=%s",
+        cfg.fxp_int_bits, cfg.fxp_frac_bits,
+        cfg.enable_rms_norm, cfg.enable_lm_head,
     )
 
-    from . import library_ops  # noqa: F401
+    from vllm.model_executor.layers.quantization import register_quantization_config
+    from . import monkey_patches
+    from .quantisation_config import FixedPointConfig
 
-    # Native torch.log_softmax was verified batch-invariant on every GPU arch
-    # (isolated probe + MATH500 end-to-end), so the sampler is left unpatched.
-    steps: list[tuple[str, Callable[[], object], Callable[[], None]]] = [
-        ("RMSNorm", monkey_patches.patch_rms_norm, _undo_rms_norm),
-        ("Attention", monkey_patches.patch_attention_backend, _noop),
-    ]
+    register_quantization_config("fixed_point_det")(FixedPointConfig)
+    logger.info("registered fixed_point_det quant config")
 
-    rollback: list[Callable[[], None]] = []
-    name = "<unknown>"
-    try:
-        for name, do, undo in steps:
-            do()
-            rollback.append(undo)
-            logger.info("%s registered", name)
-    except Exception as e:
-        logger.error("Error during %s registration: %s; rolling back", name, e)
-        for undo in reversed(rollback):
-            try:
-                undo()
-            except Exception as undo_err:
-                logger.error("Rollback step failed: %s", undo_err)
-        _registered = False
-        raise
+    monkey_patches.patch_attention_backend()
+    logger.info("registered CUSTOM attention backend")
 
+    if cfg.enable_rms_norm:
+        monkey_patches.patch_rms_norm()
+        logger.info("patched RMSNorm")
 
-def _noop() -> None:
-    return None
+    if cfg.enable_lm_head:
+        logger.info("lm_head matmul will route through gemm_fxp")
 
-
-def _undo_rms_norm() -> None:
-    try:
-        from vllm.model_executor.custom_op import op_registry
-
-        op_registry.pop("rms_norm", None)
-    except Exception as e:
-        logger.warning("RMSNorm rollback failed: %s", e)
+    _registered = True

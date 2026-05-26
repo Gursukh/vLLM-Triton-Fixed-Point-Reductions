@@ -19,25 +19,31 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name) == "1"
+
+
 @dataclass(frozen=True)
 class FxpRuntimeConfig:
     fxp_int_bits: int = DEFAULT_FXP_INT_BITS
     fxp_frac_bits: int = DEFAULT_FXP_FRAC_BITS
+    enable_rms_norm: bool = False
+    enable_lm_head: bool = False
 
 
 def load_runtime_config() -> FxpRuntimeConfig:
-    int_bits = _env_int("VLLM_FXP_INT_BITS", DEFAULT_FXP_INT_BITS)
+    int_bits = _env_int("FXPR_INT_BITS", DEFAULT_FXP_INT_BITS)
     if int_bits not in (16, 32, 64):
         logger.warning(
-            "Invalid VLLM_FXP_INT_BITS=%d; must be 16/32/64. Using default %d.",
+            "Invalid FXPR_INT_BITS=%d; must be 16/32/64. Using default %d.",
             int_bits,
             DEFAULT_FXP_INT_BITS,
         )
         int_bits = DEFAULT_FXP_INT_BITS
-    frac_bits = _env_int("VLLM_FXP_FRAC_BITS", DEFAULT_FXP_FRAC_BITS)
+    frac_bits = _env_int("FXPR_FRAC_BITS", DEFAULT_FXP_FRAC_BITS)
     if frac_bits not in (8, 16, 32):
         logger.warning(
-            "Invalid VLLM_FXP_FRAC_BITS=%d; must be 8/16/32. Using default %d.",
+            "Invalid FXPR_FRAC_BITS=%d; must be 8/16/32. Using default %d.",
             frac_bits,
             DEFAULT_FXP_FRAC_BITS,
         )
@@ -46,6 +52,8 @@ def load_runtime_config() -> FxpRuntimeConfig:
     return FxpRuntimeConfig(
         fxp_int_bits=int_bits,
         fxp_frac_bits=frac_bits,
+        enable_rms_norm=_env_flag("FXPR_ENABLE_RMS_NORM"),
+        enable_lm_head=_env_flag("FXPR_ENABLE_LM_HEAD"),
     )
 
 

@@ -6,38 +6,26 @@ import sys
 logger = logging.getLogger("fxpr_vllm")
 
 
-def patch_rms_norm() -> int:
+def patch_rms_norm() -> None:
     from vllm.model_executor.custom_op import op_registry, op_registry_oot
     import vllm.model_executor.layers.layernorm as layernorm_mod
 
     from .rms_norm import DeterministicRMSNorm
 
-    if op_registry.get("rms_norm") is not DeterministicRMSNorm:
-        DeterministicRMSNorm.name = "rms_norm"
-        op_registry["rms_norm"] = DeterministicRMSNorm
-    if op_registry_oot.get("RMSNorm") is not DeterministicRMSNorm:
-        op_registry_oot["RMSNorm"] = DeterministicRMSNorm
+    DeterministicRMSNorm.name = "rms_norm"
+    op_registry["rms_norm"] = DeterministicRMSNorm
+    op_registry_oot["RMSNorm"] = DeterministicRMSNorm
+    layernorm_mod.RMSNorm = DeterministicRMSNorm
 
-    original_rms_norm = layernorm_mod.RMSNorm
-    if original_rms_norm is not DeterministicRMSNorm:
-        layernorm_mod.RMSNorm = DeterministicRMSNorm
-
-    # rebind models that already imported the original RMSNorm.
-    patched = 0
-    for mod_name, mod in list(sys.modules.items()):
-        if mod is None or not mod_name.startswith("vllm.model_executor.models."):
-            continue
-        bound = getattr(mod, "RMSNorm", None)
-        if bound is not None and bound is not DeterministicRMSNorm:
-            setattr(mod, "RMSNorm", DeterministicRMSNorm)
-            patched += 1
-
-    if patched == 0:
+    # `from ... import RMSNorm` binds the original class, so models already
+    # imported won't pick up the patch.
+    early = [m for m in sys.modules if m.startswith("vllm.model_executor.models.")]
+    if early:
         logger.warning(
-            "DeterministicRMSNorm: no vllm.model_executor.models.* modules patched "
-            "(no models loaded yet, or vLLM import path changed)."
+            "patched RMSNorm but %d model module(s) already imported; "
+            "those still use the original",
+            len(early),
         )
-    return patched
 
 
 def patch_attention_backend() -> None:
