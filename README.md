@@ -42,7 +42,7 @@ All configured via environment variables at process start (see
 | `FXPR_FRAC_BITS`          | `16`    | `8`/`16`/`32` | Fractional bits in the Q-format. More = finer resolution, less dynamic range. |
 | `FXPR_INT_BITS`           | `32`    | `16`/`32`/`64`| Integer accumulator width. |
 | `FXPR_ENABLE_RMS_NORM`    | unset   | `1`           | Opt in to the DeterministicRMSNorm patch (off by default; leaves vLLM's stock RMSNorm in place unless set). |
-| `FXPR_ENABLE_LM_HEAD`     | unset   | `1`           | Opt in to the fixed-point lm_head matmul (off by default; requires the `fixedpoint` quant config). |
+| `FXPR_DISABLE_LM_HEAD`    | unset   | `1`           | Opt out of the fixed-point lm_head matmul (on by default; requires the `fixedpoint` quant config). |
 
 The `frac_bits` × `int_bits` pair is what fixes the dynamic range. Q16.16 in a
 32-bit accumulator gets you about ±32K in original units before saturation;

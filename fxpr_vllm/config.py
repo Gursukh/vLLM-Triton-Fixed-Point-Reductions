@@ -28,7 +28,7 @@ class FxpRuntimeConfig:
     fxp_int_bits: int = DEFAULT_FXP_INT_BITS
     fxp_frac_bits: int = DEFAULT_FXP_FRAC_BITS
     enable_rms_norm: bool = False
-    enable_lm_head: bool = False
+    enable_lm_head: bool = True
 
 
 def load_runtime_config() -> FxpRuntimeConfig:
@@ -53,7 +53,7 @@ def load_runtime_config() -> FxpRuntimeConfig:
         fxp_int_bits=int_bits,
         fxp_frac_bits=frac_bits,
         enable_rms_norm=_env_flag("FXPR_ENABLE_RMS_NORM"),
-        enable_lm_head=_env_flag("FXPR_ENABLE_LM_HEAD"),
+        enable_lm_head=not _env_flag("FXPR_DISABLE_LM_HEAD"),
     )
 
 
