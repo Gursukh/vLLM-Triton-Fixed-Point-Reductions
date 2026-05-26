@@ -24,8 +24,8 @@ def register() -> None:
     from . import monkey_patches
     from .quantisation_config import FixedPointConfig
 
-    register_quantization_config("fixed_point_det")(FixedPointConfig)
-    logger.info("registered fixed_point_det quant config")
+    register_quantization_config("fixedpoint")(FixedPointConfig)
+    logger.info("registered fixedpoint quant config")
 
     monkey_patches.patch_attention_backend()
     logger.info("registered CUSTOM attention backend")

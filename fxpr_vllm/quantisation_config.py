@@ -31,7 +31,7 @@ class FixedPointConfig(QuantizationConfig):
 
     @classmethod
     def get_name(cls) -> str:
-        return "fixed_point_det"
+        return "fixedpoint"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
