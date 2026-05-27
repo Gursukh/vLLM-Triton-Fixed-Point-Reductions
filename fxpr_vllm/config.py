@@ -29,6 +29,9 @@ class FxpRuntimeConfig:
     fxp_frac_bits: int = DEFAULT_FXP_FRAC_BITS
     enable_rms_norm: bool = False
     enable_lm_head: bool = True
+    disable_attention_warmup: bool = False
+    disable_gemm_warmup: bool = False
+    disable_rms_norm_warmup: bool = False
 
 
 def load_runtime_config() -> FxpRuntimeConfig:
@@ -54,6 +57,9 @@ def load_runtime_config() -> FxpRuntimeConfig:
         fxp_frac_bits=frac_bits,
         enable_rms_norm=_env_flag("FXPR_ENABLE_RMS_NORM"),
         enable_lm_head=not _env_flag("FXPR_DISABLE_LM_HEAD"),
+        disable_attention_warmup=_env_flag("FXPR_DISABLE_ATTENTION_WARMUP"),
+        disable_gemm_warmup=_env_flag("FXPR_DISABLE_GEMM_WARMUP"),
+        disable_rms_norm_warmup=_env_flag("FXPR_DISABLE_RMS_NORM_WARMUP"),
     )
 
 

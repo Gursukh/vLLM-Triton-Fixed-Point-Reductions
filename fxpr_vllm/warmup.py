@@ -31,6 +31,10 @@ def warmup_attention(
     global _attn_warmed
     if _attn_warmed:
         return
+    from .config import get_runtime_config
+    if get_runtime_config().disable_attention_warmup:
+        _attn_warmed = True
+        return
     # can't launch kernels during capture; try again on a later eager call.
     if torch.cuda.is_current_stream_capturing():
         return
@@ -109,6 +113,10 @@ def warmup_rms_norm(
     key = (hidden_size, dtype, device.index if device.index is not None else 0)
     if key in _rms_norm_warmed:
         return
+    from .config import get_runtime_config
+    if get_runtime_config().disable_rms_norm_warmup:
+        _rms_norm_warmed.add(key)
+        return
     if torch.cuda.is_current_stream_capturing():
         return
     _rms_norm_warmed.add(key)
@@ -141,6 +149,9 @@ def warmup_gemm(
     if key in _gemm_warmed:
         return
     _gemm_warmed.add(key)
+    from .config import get_runtime_config
+    if get_runtime_config().disable_gemm_warmup:
+        return
 
     from ._triton.gemm import _M_BUCKETS, _device_sm_count, _reachable_split_ks
 
