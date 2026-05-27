@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "triton>=3.0",
-    "vllm",
+    "vllm==0.20.2",
 ]
 
 [project.entry-points."vllm.general_plugins"]

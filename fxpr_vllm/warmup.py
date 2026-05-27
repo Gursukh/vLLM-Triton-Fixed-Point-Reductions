@@ -126,30 +126,56 @@ def warmup_rms_norm(
 def warmup_gemm(
     weight_native: torch.Tensor, int_bits: int, frac_bits: int
 ) -> None:
-    """Compile gemm_fxp for one (K, N) weight at load time. Deduped by shape    """
+    """Compile gemm_fxp for one (K, N) weight at load time. Deduped by shape.
+
+    Two sweeps cover every binary the runtime can land on: one per autotune
+    bucket (the persistent path) and one per reachable SPLIT_K. SPLIT_K is a
+    constexpr so each value is its own binary; bias is too, so we run each
+    probe with and without it. Bucket probes use M=b (top of the bucket) - if
+    any M in the bucket lands in split_k==1, b does too; otherwise the whole
+    bucket is in split-K territory and the second sweep covers it."""
     K, N = weight_native.shape
-    key = (K, N, weight_native.dtype, int(int_bits), int(frac_bits))
+    dtype = weight_native.dtype
+    device = weight_native.device
+    key = (K, N, dtype, int(int_bits), int(frac_bits))
     if key in _gemm_warmed:
         return
     _gemm_warmed.add(key)
-    from ._triton.gemm import _M_BUCKETS
+
+    from ._triton.gemm import _M_BUCKETS, _device_sm_count, _reachable_split_ks
+
     try:
-        prev = 0
+        num_sms = _device_sm_count(device)
+        bias = torch.zeros(N, device=device, dtype=dtype)
+
+        # persistent path: top of every bucket, with and without bias. first
+        # call autotunes, second compiles the path serving actually uses.
         for b in _M_BUCKETS:
-            # low and high end of the bucket.
-            probes = sorted({prev + 1, b - 1, b} & set(range(1, b + 1)))
-            prev = b
-            for m in probes:
-                a = torch.zeros(
-                    m, K, device=weight_native.device, dtype=weight_native.dtype
-                )
-                # first call autotunes, second compiles the path serving uses.
+            a = torch.zeros(b, K, device=device, dtype=dtype)
+            for bias_arg in (None, bias):
                 torch.ops.fxpr.gemm_fxp(
-                    a, weight_native, None, int(int_bits), int(frac_bits)
+                    a, weight_native, bias_arg, int(int_bits), int(frac_bits)
                 )
                 torch.ops.fxpr.gemm_fxp(
-                    a, weight_native, None, int(int_bits), int(frac_bits)
+                    a, weight_native, bias_arg, int(int_bits), int(frac_bits)
                 )
-        torch.cuda.synchronize(weight_native.device)
+
+        # split-K path: one M per reachable SPLIT_K. skip 1, the persistent
+        # path above already hit it.
+        reachable = _reachable_split_ks(N, K, dtype, num_sms, int(int_bits))
+        for split, m in reachable.items():
+            if split == 1:
+                continue
+            a = torch.zeros(m, K, device=device, dtype=dtype)
+            for bias_arg in (None, bias):
+                torch.ops.fxpr.gemm_fxp(
+                    a, weight_native, bias_arg, int(int_bits), int(frac_bits)
+                )
+
+        torch.cuda.synchronize(device)
+        logger.info(
+            "fxpr gemm warmed K=%d N=%d dtype=%s (buckets=%d, splits=%d)",
+            K, N, dtype, len(_M_BUCKETS), len(reachable),
+        )
     except Exception as e:  # noqa: BLE001 - warmup must never break serving
         logger.warning("fxpr gemm warmup skipped for K=%d N=%d: %s", K, N, e)

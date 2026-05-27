@@ -388,6 +388,31 @@ def _bucket_m(M: int) -> int:
     return _M_BUCKETS[-1]
 
 
+def _reachable_split_ks(
+    N: int,
+    K: int,
+    dtype: torch.dtype,
+    num_sms: int,
+    int_bits: int,
+    max_M: int | None = None,
+) -> dict[int, int]:
+    """Every SPLIT_K _pick_split_k can return for this (N, K, dtype), with the
+    smallest M that reaches it. Warmup uses this to compile every split-K
+    binary up front instead of sweeping every M. _pick_split_k only sees M
+    through cdiv(M, sk_block_m), so we walk that one tile count at a time."""
+    sk_block_m = _CFG_SPLITK[0]
+    sk_block_n = _CFG_SPLITK[1]
+    block_k = _BLOCK_K_BY_DTYPE[dtype]
+    num_k_tiles = triton.cdiv(K, block_k)
+    upper = max_M if max_M is not None else _M_BUCKETS[-1]
+    out: dict[int, int] = {}
+    for pid_m in range(1, triton.cdiv(upper, sk_block_m) + 1):
+        num_tiles_mn = pid_m * triton.cdiv(N, sk_block_n)
+        s = _pick_split_k(num_tiles_mn, num_k_tiles, num_sms, int_bits)
+        out.setdefault(s, pid_m * sk_block_m)
+    return out
+
+
 # Candidate Configs (BM, BN, GROUP_SIZE_M, num_warps, num_stages) span every
 # server arch from L4 (sm_89, ~100 KB SMEM, 30 SMs) up to A100/H100/Blackwell
 # (up to ~228 KB SMEM, 100+ SMs). Configs that don't fit a GPU's SMEM budget
