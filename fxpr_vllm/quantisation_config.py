@@ -58,8 +58,8 @@ class FixedPointConfig(QuantizationConfig):
             return FixedPointLinearMethod(self)
         # ParallelLMHead subclasses this. cuBLAS switches GEMV (M=1) vs GEMM
         # (M>=2), flipping tokens on Blackwell; gemm_fxp stays batch-invariant.
-        # Opt-in and off by default (mirrors FXPR_ENABLE_RMS_NORM); when unset
-        # the lm_head matmul falls back to vLLM's default method.
+        # On by default (mirrors RMS norm, opt out via FXPR_DISABLE_LM_HEAD);
+        # when disabled the lm_head matmul falls back to vLLM's default method.
         if isinstance(layer, VocabParallelEmbedding):
             if get_runtime_config().enable_lm_head:
                 return FixedPointEmbeddingMethod(self)
