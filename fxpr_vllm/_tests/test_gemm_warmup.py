@@ -32,6 +32,8 @@ def test_reachable_split_ks_round_trip():
         (4096, 4096, torch.float16, 108, 32),  # square, prefill
         (128, 8192, torch.bfloat16, 132, 32),  # H100-ish
         (64, 2048, torch.float16, 132, 16),    # int16, forces split_k=1
+        (4096, 14336, torch.bfloat16, 108, 32),  # A100, down_proj
+        (4096, 14336, torch.bfloat16, 188, 32),  # Blackwell, down_proj
     ]
     for N, K, dtype, num_sms, int_bits in cases:
         reachable = _reachable_split_ks(N, K, dtype, num_sms, int_bits)

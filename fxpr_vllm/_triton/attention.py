@@ -37,6 +37,16 @@ _BLOCK_N_BY_DTYPE = {
 
 _SPLIT_OCCUPANCY = 2  # ~2 split programs per SM for latency hiding
 
+# KV-split thresholds, tuned against decode sweeps on L4/A100/Blackwell. The old
+# version only looked at batch vs SM count and never at context length, so it
+# split short-context batch=1 decode
+# (which made it ~170% slower) and refused to split long-context batched decode
+# (leaving ~50% on the table). These thresholds split only when there's enough
+# KV work to pay for the atomic-add combine and the SMs aren't already full.
+_MIN_KV_TILES_FOR_SPLIT = 32   # fewer KV tiles than this: just fuse
+_MAX_NUM_SPLITS = 8            # past here the combine costs more than it saves
+_SPLIT_BASE_OVERSUB = 2        # base over this many * SMs means we're saturated
+
 
 def _next_pow2(n: int) -> int:
     if n <= 1:
@@ -656,16 +666,27 @@ def _pick_num_splits(
     num_requests: int,
     num_q_blocks: int,
     num_heads: int,
+    num_kv_tiles: int,
     device: torch.device,
 ) -> int:
-    # Explicit override wins; tests pass requested >= 1 to force a split count.
+    # An explicit request wins; tests pass requested >= 1 to force a split count.
     if requested >= 1:
         return requested
-    # Static-only inputs (batch, q-blocks, heads, SM count), so safe under
-    # CUDA-graph capture. Small batches get more splits to fill the SMs.
+    # Everything we key off of is static (batch, q-blocks, heads, KV-tile count
+    # from the block-table shape, SM count), so this is safe to bake into a graph.
     _, num_sms = _arch_info(device)
+    # Short context: not enough KV work to pay back the atomic-add combine.
+    if num_kv_tiles <= _MIN_KV_TILES_FOR_SPLIT:
+        return 1
+    # The request/q-block/head tiling already fills the device, so splitting
+    # would just add combine contention (this is the large-batch decode case).
     base = max(1, num_requests * num_q_blocks * num_heads)
-    return _next_pow2(max(1, (num_sms * _SPLIT_OCCUPANCY) // base))
+    if base > _SPLIT_BASE_OVERSUB * num_sms:
+        return 1
+    # Otherwise split to shorten the KV scan: roughly _MIN_KV_TILES_FOR_SPLIT
+    # tiles per split, capped, rounded down to a power of two.
+    split = min(num_kv_tiles // _MIN_KV_TILES_FOR_SPLIT, _MAX_NUM_SPLITS)
+    return _next_pow2(split) if split >= 2 else 1
 
 
 def unified_attention_fxp_run(
@@ -740,9 +761,16 @@ def unified_attention_fxp_run(
     block_d = max(_next_pow2(head_dim), 16)
     num_q_blocks = max(1, triton.cdiv(max(1, int(max_query_len)), block_m))
 
+    # Estimate KV tiles from the block-table width. block_table is
+    # (num_requests, max_blocks_per_seq), so max_blocks_per_seq * page_size bounds
+    # the context length from above. It's just a host-side shape (no device sync)
+    # and stays fixed across a graph capture, which is what the split needs.
+    max_kv_blocks = block_table.shape[1] if block_table.dim() == 2 else 0
+    num_kv_tiles = triton.cdiv(max(1, max_kv_blocks * page_size), block_n)
+
     effective_splits = _pick_num_splits(
         int(num_kv_splits), int(num_requests), int(num_q_blocks),
-        int(num_heads), q.device,
+        int(num_heads), int(num_kv_tiles), q.device,
     )
 
     scale, inv_scale, qmin, qmax, tl_int_dtype, torch_int_dtype = fxp_constants(

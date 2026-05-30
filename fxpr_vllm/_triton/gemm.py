@@ -346,7 +346,19 @@ def _device_sm_count(device: torch.device) -> int:
     return n
 
 
-_MIN_SPLIT_K = 4
+# Split-K thresholds, tuned against M-sweeps on L4/A100/Blackwell. The old
+# num_sms // num_tiles_mn formula split small and medium layers at small M and
+# made decode up to 47% slower with nothing to show for it -- worse than just
+# staying on the persistent path. The old M=128-only benchmark never caught it.
+# Split-K only earns its keep on very-large-K layers (llama-8b down_proj has 112
+# K-tiles) at moderate M, on a device the (M, N) tiling hasn't filled yet.
+_SPLITK_MIN_K_TILES = 96     # fewer K-tiles than this: persistent always wins
+_SPLITK_MIN_TILES_MN = 96    # too little (M, N) work (tiny M): stay persistent
+_SPLITK_SPLIT = 2            # the split count that tuned best (also the cap)
+# 1.5x oversubscription written as an integer ratio (2*tiles_mn <= 3*num_sms):
+# once the MN tiling is past ~1.5x the SMs, more K-splits just fight over atomics.
+_SPLITK_OVERSUB_NUM = 3
+_SPLITK_OVERSUB_DEN = 2
 
 
 def _pick_split_k(
@@ -358,21 +370,17 @@ def _pick_split_k(
     # int16 atomics aren't broadly supported; skip split-K for them.
     if int_bits == 16:
         return 1
-    # Split-K helps only when (M, N) tiling doesn't saturate the device. Once
-    # num_tiles_mn reaches num_sms, more splits just add atomic contention.
-    # num_tiles_mn uses _CFG_SPLITK, so this gate matches the actual tiling.
-    if num_tiles_mn >= num_sms or num_k_tiles <= 1:
+    # Need enough serial K work for the split to beat the persistent path.
+    # Small-K layers never do, and splitting them is what regressed decode before.
+    if num_k_tiles < _SPLITK_MIN_K_TILES:
         return 1
-    split = max(1, num_sms // max(1, num_tiles_mn))
-    split = min(_MAX_SPLIT_K, split, num_k_tiles)
-    # 2-3 way splits don't recoup the per-tile epilogue cost (atomic-add, lock
-    # increment, last-writer read-back + dequant + store, scratch zero - approx
-    # 10us/tile). The persistent path's autotune-bypassed dispatch (~75us floor
-    # at small M) wins. Observed: M=128 qkv/o/down sat at 95-99us via split=2-3,
-    # drop to ~75us on the persistent path.
-    if split < _MIN_SPLIT_K:
+    # Need real (M, N) work (skip tiny M) and some spare room on the device: once
+    # the MN tiling is past ~1.5x the SMs, more K-splits just add contention.
+    if num_tiles_mn < _SPLITK_MIN_TILES_MN:
         return 1
-    return split
+    if _SPLITK_OVERSUB_DEN * num_tiles_mn > _SPLITK_OVERSUB_NUM * num_sms:
+        return 1
+    return min(_SPLITK_SPLIT, num_k_tiles)
 
 
 # Coarse pow2-ish buckets bound the autotune cache; without them the tuner would
