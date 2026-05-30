@@ -21,7 +21,7 @@ def _splitk_from_M(M: int, N: int, K: int, dtype: torch.dtype, num_sms: int, int
     block_k = _BLOCK_K_BY_DTYPE[dtype]
     num_k_tiles = (K + block_k - 1) // block_k
     num_tiles_mn = ((M + sk_block_m - 1) // sk_block_m) * ((N + sk_block_n - 1) // sk_block_n)
-    return _pick_split_k(num_tiles_mn, num_k_tiles, num_sms, int_bits)
+    return _pick_split_k(num_tiles_mn, num_k_tiles, num_sms, int_bits, M)
 
 
 def test_reachable_split_ks_round_trip():

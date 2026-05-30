@@ -346,19 +346,15 @@ def _device_sm_count(device: torch.device) -> int:
     return n
 
 
-# Split-K thresholds, tuned against M-sweeps on L4/A100/Blackwell. The old
-# num_sms // num_tiles_mn formula split small and medium layers at small M and
-# made decode up to 47% slower with nothing to show for it -- worse than just
-# staying on the persistent path. The old M=128-only benchmark never caught it.
-# Split-K only earns its keep on very-large-K layers (llama-8b down_proj has 112
-# K-tiles) at moderate M, on a device the (M, N) tiling hasn't filled yet.
-_SPLITK_MIN_K_TILES = 96     # fewer K-tiles than this: persistent always wins
-_SPLITK_MIN_TILES_MN = 96    # too little (M, N) work (tiny M): stay persistent
-_SPLITK_SPLIT = 2            # the split count that tuned best (also the cap)
-# 1.5x oversubscription written as an integer ratio (2*tiles_mn <= 3*num_sms):
-# once the MN tiling is past ~1.5x the SMs, more K-splits just fight over atomics.
-_SPLITK_OVERSUB_NUM = 3
-_SPLITK_OVERSUB_DEN = 2
+# Split-K thresholds, from an M-sweep on L4/A100/Blackwell. It only pays on a
+# wide-K layer (down_proj) at large enough M; everywhere else persistent wins.
+# See _pick_split_k for how the M floor and wave test are applied.
+_SPLITK_MIN_K_TILES = 96   # below this the K reduction is too short to pay for
+                           # the combine; also rules out the ~32-tile narrow layers
+_SPLITK_MIN_M = 2 * _CFG_SPLITK[0]   # at least 2 full split-K tiles (BLOCK_M=64)
+_SPLITK_SPLIT = 2          # split count and cap; 2 was the sweet spot
+_SPLITK_WAVE_MARGIN_NUM = 6   # split when s*w1/ws is at least 6/5 (1.2x), kept
+_SPLITK_WAVE_MARGIN_DEN = 5   # as an integer ratio to stay exact
 
 
 def _pick_split_k(
@@ -366,6 +362,7 @@ def _pick_split_k(
     num_k_tiles: int,
     num_sms: int,
     int_bits: int,
+    M: int,
 ) -> int:
     # int16 atomics aren't broadly supported; skip split-K for them.
     if int_bits == 16:
@@ -374,13 +371,20 @@ def _pick_split_k(
     # Small-K layers never do, and splitting them is what regressed decode before.
     if num_k_tiles < _SPLITK_MIN_K_TILES:
         return 1
-    # Need real (M, N) work (skip tiny M) and some spare room on the device: once
-    # the MN tiling is past ~1.5x the SMs, more K-splits just add contention.
-    if num_tiles_mn < _SPLITK_MIN_TILES_MN:
+    # Short batches stay persistent: with fewer than 2 full tiles split-K just
+    # wastes its fixed BLOCK_M on masked rows. This covers the whole decode range.
+    if M < _SPLITK_MIN_M:
         return 1
-    if _SPLITK_OVERSUB_DEN * num_tiles_mn > _SPLITK_OVERSUB_NUM * num_sms:
+    split = min(_SPLITK_SPLIT, num_k_tiles)
+    if split < 2:
         return 1
-    return min(_SPLITK_SPLIT, num_k_tiles)
+    # Both kernels run one program per SM-wide wave, so splitting K only helps if
+    # the extra, shallower waves it adds still come out ahead of the combine cost.
+    w1 = -(-num_tiles_mn // num_sms)            # ceil(tiles_mn / num_sms)
+    ws = -(-(split * num_tiles_mn) // num_sms)  # ceil(split * tiles_mn / num_sms)
+    if split * w1 * _SPLITK_WAVE_MARGIN_DEN >= ws * _SPLITK_WAVE_MARGIN_NUM:
+        return split
+    return 1
 
 
 # Coarse pow2-ish buckets bound the autotune cache; without them the tuner would
@@ -405,9 +409,10 @@ def _reachable_split_ks(
     max_M: int | None = None,
 ) -> dict[int, int]:
     """Every SPLIT_K _pick_split_k can return for this (N, K, dtype), with the
-    smallest M that reaches it. Warmup uses this to compile every split-K
-    binary up front instead of sweeping every M. _pick_split_k only sees M
-    through cdiv(M, sk_block_m), so we walk that one tile count at a time."""
+    smallest M that reaches it. Warmup uses this to compile every split-K binary
+    up front instead of sweeping every M. M only feeds the pick through its tile
+    count and the M floor, and both rise with M, so checking each tile count at
+    its largest M is enough to see every split it can produce."""
     sk_block_m = _CFG_SPLITK[0]
     sk_block_n = _CFG_SPLITK[1]
     block_k = _BLOCK_K_BY_DTYPE[dtype]
@@ -416,7 +421,7 @@ def _reachable_split_ks(
     out: dict[int, int] = {}
     for pid_m in range(1, triton.cdiv(upper, sk_block_m) + 1):
         num_tiles_mn = pid_m * triton.cdiv(N, sk_block_n)
-        s = _pick_split_k(num_tiles_mn, num_k_tiles, num_sms, int_bits)
+        s = _pick_split_k(num_tiles_mn, num_k_tiles, num_sms, int_bits, pid_m * sk_block_m)
         out.setdefault(s, pid_m * sk_block_m)
     return out
 
@@ -639,7 +644,7 @@ def gemm_fxp_run(
     sk_block_m, sk_block_n, sk_group_size_m, sk_num_warps, sk_num_stages = _CFG_SPLITK
     sk_num_pid_m = triton.cdiv(M, sk_block_m)
     sk_num_tiles_mn = sk_num_pid_m * triton.cdiv(N, sk_block_n)
-    split_k = _pick_split_k(sk_num_tiles_mn, num_k_tiles, num_sms, int_bits)
+    split_k = _pick_split_k(sk_num_tiles_mn, num_k_tiles, num_sms, int_bits, M)
 
     if split_k == 1:
         # Fast path: NUM_SMS is constexpr per GPU so it compiles once. Once the
