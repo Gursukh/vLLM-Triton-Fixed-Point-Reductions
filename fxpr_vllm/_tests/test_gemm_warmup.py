@@ -15,11 +15,12 @@ from .fixed_point_helpers import requires_cuda, skip_if_dtype_unsupported
 
 def test_resolve_split_k_uses_cache_then_persistent():
     """The runtime split decision reads the warmup-measured cache, honours a
-    forced override, and clamps on int16 / K-tiles / scratch. An un-probed shape
-    stays persistent. No GPU needed."""
+    forced override, and clamps on int16 / K-tiles / c_int scratch / lock buffer.
+    An un-probed shape stays persistent. No GPU needed."""
     dtype = torch.bfloat16
     key = (3, 4096, 14336, dtype, 32)  # (sk_pid_m, N, K, dtype, int_bits)
-    big = 10**12  # scratch large enough not to bind
+    big = 10**12  # scratch / locks large enough not to bind
+    tiles = 192   # sk_num_tiles_mn, within any non-binding lock capacity
     saved = dict(gemm._SPLITK_CHOICE)
     try:
         gemm._SPLITK_FORCE = None
@@ -27,30 +28,34 @@ def test_resolve_split_k_uses_cache_then_persistent():
 
         # cached split-2 is used as-is
         gemm._SPLITK_CHOICE[key] = 2
-        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, big) == 2
+        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, big, tiles, big) == 2
 
         # cached persistent is honoured
         gemm._SPLITK_CHOICE[key] = 1
-        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, big) == 1
+        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, big, tiles, big) == 1
 
         # a forced value beats the cache (this is how warmup times each path)
         gemm._SPLITK_FORCE = 2
-        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, big) == 2
+        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, big, tiles, big) == 2
         gemm._SPLITK_FORCE = None
 
         # int16 never splits, regardless of cache
-        assert _resolve_split_k(3, 112, 16, 192, 4096, 14336, dtype, big) == 1
+        assert _resolve_split_k(3, 112, 16, 192, 4096, 14336, dtype, big, tiles, big) == 1
 
         # scratch too small for M*N -> persistent
         gemm._SPLITK_CHOICE[key] = 2
-        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, 1) == 1
+        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, 1, tiles, big) == 1
+
+        # more (m,n) tiles than the lock buffer holds -> persistent. This is the
+        # case that corrupted Llama: a wide-N layer's tile count outran the locks.
+        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, big, 5000, 256) == 1
 
         # fewer K-tiles than the split count -> persistent
-        assert _resolve_split_k(3, 1, 32, 192, 4096, 14336, dtype, big) == 1
+        assert _resolve_split_k(3, 1, 32, 192, 4096, 14336, dtype, big, tiles, big) == 1
 
         # un-probed tile count (empty cache) -> persistent
         gemm._SPLITK_CHOICE.clear()
-        assert _resolve_split_k(1, 112, 32, 64, 4096, 14336, dtype, big) == 1
+        assert _resolve_split_k(1, 112, 32, 64, 4096, 14336, dtype, big, tiles, big) == 1
     finally:
         gemm._SPLITK_FORCE = None
         gemm._SPLITK_CHOICE.clear()

@@ -62,6 +62,22 @@ _MAX_SPLIT_K = 16
 # 128*128 ints; the epilogue self-zeroes it.
 _TILE_M_MAX = 128
 _TILE_N_MAX = 128
+
+# The split-K kernel needs one int32 lock per (m,n) tile, indexed by tile_id_mn
+# in [0, sk_num_tiles_mn). A 128*128 slab of c_int holds this many 64x64 split-K
+# tiles, so target_programs slabs hold target_programs * this many. N not landing
+# on a 64 boundary adds up to one extra tile per row-tile, and autotune never
+# probes past 16 row-tiles, so a +16 margin covers any shape that fits c_int.
+_MAX_TILES_PER_PROGRAM = (_TILE_M_MAX // _CFG_SPLITK[0]) * (_TILE_N_MAX // _CFG_SPLITK[1])
+_SPLITK_LOCK_MARGIN = 16
+
+
+def _splitk_locks_len(target_programs: int) -> int:
+    """Lock-buffer length: large enough for the most tiles any clamp-passing
+    split-K shape can produce. _resolve_split_k also refuses to split past it."""
+    return target_programs * _MAX_TILES_PER_PROGRAM + _SPLITK_LOCK_MARGIN
+
+
 _splitk_scratch: dict[
     tuple[int, torch.dtype], tuple[torch.Tensor, torch.Tensor]
 ] = {}
@@ -70,10 +86,10 @@ _splitk_scratch: dict[
 def _get_splitk_scratch(
     device: torch.device, int_dtype: torch.dtype, target_programs: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Persistent (c_int_flat, locks_flat) scratch for the split-K path. Sized
-    for the worst case, zeroed once; the epilogue rezeroes its own footprint.
-    Allocated in warmup before graph capture and fixed in size, so it never
-    moves."""
+    """Persistent (c_int_flat, locks_flat) scratch for the split-K path. Both are
+    sized for the worst case (c_int by ints, locks by tile count) and zeroed once;
+    the epilogue rezeroes its own footprint. Allocated in warmup before graph
+    capture and fixed in size, so it never moves."""
     idx = device.index if device.index is not None else torch.cuda.current_device()
     key = (idx, int_dtype)
     cached = _splitk_scratch.get(key)
@@ -83,7 +99,9 @@ def _get_splitk_scratch(
             device=device,
             dtype=int_dtype,
         )
-        locks = torch.zeros(target_programs, device=device, dtype=torch.int32)
+        locks = torch.zeros(
+            _splitk_locks_len(target_programs), device=device, dtype=torch.int32
+        )
         cached = (c_int, locks)
         _splitk_scratch[key] = cached
     return cached
@@ -373,10 +391,13 @@ def _resolve_split_k(
     K: int,
     dtype: torch.dtype,
     scratch_ints: int,
+    sk_num_tiles_mn: int,
+    locks_capacity: int,
 ) -> int:
     """Pick the split count for this call. While warmup is timing it's whatever's
     pinned; otherwise it's the choice warmup measured, defaulting to persistent.
-    Clamped so it can't exceed the K-tiles or overrun the split-K scratch."""
+    Clamped so it can't exceed the K-tiles, overrun the c_int scratch (M*N), or
+    index past the lock buffer (one lock per (m,n) tile)."""
     if int_bits == 16:   # int16 atomics aren't broadly supported
         return 1
     if _SPLITK_FORCE is not None:
@@ -386,7 +407,7 @@ def _resolve_split_k(
     if split <= 1:
         return 1
     split = min(split, num_k_tiles)
-    if split < 2 or M * N > scratch_ints:
+    if split < 2 or M * N > scratch_ints or sk_num_tiles_mn > locks_capacity:
         return 1
     return split
 
@@ -622,8 +643,10 @@ def gemm_fxp_run(
     sk_num_pid_m = triton.cdiv(M, sk_block_m)
     sk_num_tiles_mn = sk_num_pid_m * triton.cdiv(N, sk_block_n)
     scratch_ints = target_programs * _TILE_M_MAX * _TILE_N_MAX
+    locks_capacity = _splitk_locks_len(target_programs)
     split_k = _resolve_split_k(
         sk_num_pid_m, num_k_tiles, int_bits, M, N, K, a.dtype, scratch_ints,
+        sk_num_tiles_mn, locks_capacity,
     )
 
     if split_k == 1:
