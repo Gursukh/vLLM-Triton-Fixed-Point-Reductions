@@ -6,6 +6,8 @@ bit-identical however the problem is tiled or split.
 
 from __future__ import annotations
 
+import statistics
+
 import torch
 import triton
 import triton.language as tl
@@ -346,12 +348,11 @@ def _device_sm_count(device: torch.device) -> int:
     return n
 
 
-# Whether to split a GEMM's K reduction is decided per shape at warmup, by timing
-# both paths on the real GPU (autotune_split_k). Both give identical bits, so
-# it's only a speed question, and we measure it instead of predicting it: a
-# formula doesn't work because the persistent/split crossover depends on the GPU,
-# and the same shape can want opposite paths on A100 and Blackwell. The cache
-# below holds the winners; anything warmup didn't probe stays persistent.
+# Splitting a GEMM's K reduction helps on some shapes and hurts on others, and no
+# formula predicts which: the crossover even flips between A100 and Blackwell for
+# the same shape. Both paths give identical bits, so it's only a speed question.
+# Warmup times both on the real GPU and caches the winner here (autotune_split_k);
+# anything warmup didn't probe stays persistent.
 _SPLITK_SPLIT = 2          # the split count autotune tries (and the cap)
 
 # Measured split choice (1 or 2), keyed by (sk_pid_m, N, K, dtype, int_bits).
@@ -739,19 +740,25 @@ def gemm_fxp_run(
     return c
 
 
-# Warmup-time split-K autotuning. A few discarded runs to settle/JIT, then the
-# min over a handful of timed runs (the fastest is the cleanest read).
-_AUTOTUNE_WARMUP = 3
-_AUTOTUNE_ITERS = 15
-_AUTOTUNE_MAX_PID = 16   # probe up to M = 16*BLOCK_M (1024); split rarely helps
-                         # past that and the scratch buffer caps it anyway
+# Warmup-time split-K autotuning. We time each path as a block of back-to-back
+# calls, not one synced kernel at a time, because serving runs them back-to-back
+# under a CUDA graph and split-K is faster that way (warm scratch, pipelined
+# launches) than single-call timing suggests. Median over a few blocks ignores
+# spikes; split must win by a small margin, and since the output is identical
+# either way, a tie going to persistent costs nothing.
+_AUTOTUNE_WARMUP = 3      # discarded calls before timing
+_AUTOTUNE_ITERS = 15      # calls per timed block, so launch cost amortises
+_AUTOTUNE_REPS = 3        # blocks per path; compare the medians
+_AUTOTUNE_MAX_PID = 16    # probe up to M = 16*BLOCK_M (1024); split rarely helps
+                          # past that and the scratch buffer caps it anyway
+_AUTOTUNE_MARGIN = 0.02   # split must be at least 2% faster to be worth picking
 
 
 def autotune_split_k(
     weight_native: torch.Tensor, int_bits: int, frac_bits: int
 ) -> int:
     """Time persistent vs two-way split for this (K, N) weight at each split-K
-    row-tile count and cache the faster one in _SPLITK_CHOICE. Called from warmup
+    row-tile count and cache the faster one in _SPLITK_CHOICE. Call from warmup
     once the persistent configs are compiled. Both paths give the same bits, so
     this only changes speed, never the output. int16 and single-K-tile shapes
     can't split and stay persistent. Returns how many tile counts went to
@@ -768,38 +775,39 @@ def autotune_split_k(
     num_sms = _device_sm_count(device)
     scratch_ints = num_sms * _BLOCKS_PER_SM * _TILE_M_MAX * _TILE_N_MAX
     sk_block_m = _CFG_SPLITK[0]
-
-    def _best_us(a: torch.Tensor) -> float:
-        for _ in range(_AUTOTUNE_WARMUP):
-            gemm_fxp_run(a, weight_native, None, int_bits, frac_bits)
-        torch.cuda.synchronize(device)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        best = float("inf")
-        for _ in range(_AUTOTUNE_ITERS):
-            start.record()
-            gemm_fxp_run(a, weight_native, None, int_bits, frac_bits)
-            end.record()
-            end.synchronize()
-            best = min(best, start.elapsed_time(end))
-        return best
+    paths = (1, _SPLITK_SPLIT)
 
     routed = 0
-    for pid_m in range(1, _AUTOTUNE_MAX_PID + 1):
-        M = pid_m * sk_block_m
-        if M * N > scratch_ints:   # split-2's scratch wouldn't fit beyond here
-            break
-        a = torch.zeros(M, K, device=device, dtype=dtype)
-        try:
-            _SPLITK_FORCE = 1
-            t_persistent = _best_us(a)
-            _SPLITK_FORCE = _SPLITK_SPLIT
-            t_split = _best_us(a)
-        finally:
-            _SPLITK_FORCE = None
-        # Record the measured winner either way. Ties go to persistent (identical
-        # output, so the tie-break is free).
-        use_split = t_split < t_persistent
-        _SPLITK_CHOICE[(pid_m, N, K, dtype, int_bits)] = _SPLITK_SPLIT if use_split else 1
-        routed += int(use_split)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    try:
+        for pid_m in range(1, _AUTOTUNE_MAX_PID + 1):
+            M = pid_m * sk_block_m
+            if M * N > scratch_ints:   # split-2's scratch wouldn't fit beyond here
+                break
+            a = torch.randn(M, K, device=device, dtype=dtype)
+            # time each path as a block of back-to-back calls (like serving),
+            # median over a few blocks
+            t = {}
+            for force in paths:
+                _SPLITK_FORCE = force
+                for _ in range(_AUTOTUNE_WARMUP):   # settle and JIT, discarded
+                    gemm_fxp_run(a, weight_native, None, int_bits, frac_bits)
+                torch.cuda.synchronize(device)
+                per_call = []
+                for _ in range(_AUTOTUNE_REPS):
+                    start.record()
+                    for _ in range(_AUTOTUNE_ITERS):
+                        gemm_fxp_run(a, weight_native, None, int_bits, frac_bits)
+                    end.record()
+                    end.synchronize()
+                    per_call.append(start.elapsed_time(end) / _AUTOTUNE_ITERS)
+                t[force] = statistics.median(per_call)
+            use_split = t[_SPLITK_SPLIT] < t[1] * (1.0 - _AUTOTUNE_MARGIN)
+            _SPLITK_CHOICE[(pid_m, N, K, dtype, int_bits)] = (
+                _SPLITK_SPLIT if use_split else 1
+            )
+            routed += int(use_split)
+    finally:
+        _SPLITK_FORCE = None
     return routed
