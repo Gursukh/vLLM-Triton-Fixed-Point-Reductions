@@ -346,45 +346,48 @@ def _device_sm_count(device: torch.device) -> int:
     return n
 
 
-# Split-K thresholds, from an M-sweep on L4/A100/Blackwell. It only pays on a
-# wide-K layer (down_proj) at large enough M; everywhere else persistent wins.
-# See _pick_split_k for how the M floor and wave test are applied.
-_SPLITK_MIN_K_TILES = 96   # below this the K reduction is too short to pay for
-                           # the combine; also rules out the ~32-tile narrow layers
-_SPLITK_MIN_M = 2 * _CFG_SPLITK[0]   # at least 2 full split-K tiles (BLOCK_M=64)
-_SPLITK_SPLIT = 2          # split count and cap; 2 was the sweet spot
-_SPLITK_WAVE_MARGIN_NUM = 6   # split when s*w1/ws is at least 6/5 (1.2x), kept
-_SPLITK_WAVE_MARGIN_DEN = 5   # as an integer ratio to stay exact
+# Whether to split a GEMM's K reduction is decided per shape at warmup, by timing
+# both paths on the real GPU (autotune_split_k). Both give identical bits, so
+# it's only a speed question, and we measure it instead of predicting it: a
+# formula doesn't work because the persistent/split crossover depends on the GPU,
+# and the same shape can want opposite paths on A100 and Blackwell. The cache
+# below holds the winners; anything warmup didn't probe stays persistent.
+_SPLITK_SPLIT = 2          # the split count autotune tries (and the cap)
+
+# Measured split choice (1 or 2), keyed by (sk_pid_m, N, K, dtype, int_bits).
+# sk_pid_m is the split-K kernel's row-tile count, ceil(M / BLOCK_M). Keying on
+# it instead of the coarser autotune bucket keeps batch sizes that want different
+# paths from sharing an entry. A missing key means stay persistent.
+_SPLITK_CHOICE: dict[tuple, int] = {}
+# Set only while autotune_split_k is timing, to pin a path; None otherwise.
+_SPLITK_FORCE: int | None = None
 
 
-def _pick_split_k(
-    num_tiles_mn: int,
+def _resolve_split_k(
+    sk_pid_m: int,
     num_k_tiles: int,
-    num_sms: int,
     int_bits: int,
     M: int,
+    N: int,
+    K: int,
+    dtype: torch.dtype,
+    scratch_ints: int,
 ) -> int:
-    # int16 atomics aren't broadly supported; skip split-K for them.
-    if int_bits == 16:
+    """Pick the split count for this call. While warmup is timing it's whatever's
+    pinned; otherwise it's the choice warmup measured, defaulting to persistent.
+    Clamped so it can't exceed the K-tiles or overrun the split-K scratch."""
+    if int_bits == 16:   # int16 atomics aren't broadly supported
         return 1
-    # Need enough serial K work for the split to beat the persistent path.
-    # Small-K layers never do, and splitting them is what regressed decode before.
-    if num_k_tiles < _SPLITK_MIN_K_TILES:
+    if _SPLITK_FORCE is not None:
+        split = _SPLITK_FORCE
+    else:
+        split = _SPLITK_CHOICE.get((sk_pid_m, N, K, dtype, int_bits), 1)
+    if split <= 1:
         return 1
-    # Short batches stay persistent: with fewer than 2 full tiles split-K just
-    # wastes its fixed BLOCK_M on masked rows. This covers the whole decode range.
-    if M < _SPLITK_MIN_M:
+    split = min(split, num_k_tiles)
+    if split < 2 or M * N > scratch_ints:
         return 1
-    split = min(_SPLITK_SPLIT, num_k_tiles)
-    if split < 2:
-        return 1
-    # Both kernels run one program per SM-wide wave, so splitting K only helps if
-    # the extra, shallower waves it adds still come out ahead of the combine cost.
-    w1 = -(-num_tiles_mn // num_sms)            # ceil(tiles_mn / num_sms)
-    ws = -(-(split * num_tiles_mn) // num_sms)  # ceil(split * tiles_mn / num_sms)
-    if split * w1 * _SPLITK_WAVE_MARGIN_DEN >= ws * _SPLITK_WAVE_MARGIN_NUM:
-        return split
-    return 1
+    return split
 
 
 # Coarse pow2-ish buckets bound the autotune cache; without them the tuner would
@@ -398,32 +401,6 @@ def _bucket_m(M: int) -> int:
         if M <= b:
             return b
     return _M_BUCKETS[-1]
-
-
-def _reachable_split_ks(
-    N: int,
-    K: int,
-    dtype: torch.dtype,
-    num_sms: int,
-    int_bits: int,
-    max_M: int | None = None,
-) -> dict[int, int]:
-    """Every SPLIT_K _pick_split_k can return for this (N, K, dtype), with the
-    smallest M that reaches it. Warmup uses this to compile every split-K binary
-    up front instead of sweeping every M. M only feeds the pick through its tile
-    count and the M floor, and both rise with M, so checking each tile count at
-    its largest M is enough to see every split it can produce."""
-    sk_block_m = _CFG_SPLITK[0]
-    sk_block_n = _CFG_SPLITK[1]
-    block_k = _BLOCK_K_BY_DTYPE[dtype]
-    num_k_tiles = triton.cdiv(K, block_k)
-    upper = max_M if max_M is not None else _M_BUCKETS[-1]
-    out: dict[int, int] = {}
-    for pid_m in range(1, triton.cdiv(upper, sk_block_m) + 1):
-        num_tiles_mn = pid_m * triton.cdiv(N, sk_block_n)
-        s = _pick_split_k(num_tiles_mn, num_k_tiles, num_sms, int_bits, pid_m * sk_block_m)
-        out.setdefault(s, pid_m * sk_block_m)
-    return out
 
 
 # Candidate Configs (BM, BN, GROUP_SIZE_M, num_warps, num_stages) span every
@@ -638,13 +615,15 @@ def gemm_fxp_run(
     target_programs = num_sms * _BLOCKS_PER_SM
     num_k_tiles = triton.cdiv(K, block_k)
 
-    # Decide split-K against the split-K kernel's own tiling (_CFG_SPLITK) - the
-    # BM/BN it actually runs with. The persistent path's autotune-chosen tiling
-    # doesn't enter the decision.
+    # Tile counts under the split-K kernel's own tiling (_CFG_SPLITK), which is
+    # what _resolve_split_k keys and clamps against.
     sk_block_m, sk_block_n, sk_group_size_m, sk_num_warps, sk_num_stages = _CFG_SPLITK
     sk_num_pid_m = triton.cdiv(M, sk_block_m)
     sk_num_tiles_mn = sk_num_pid_m * triton.cdiv(N, sk_block_n)
-    split_k = _pick_split_k(sk_num_tiles_mn, num_k_tiles, num_sms, int_bits, M)
+    scratch_ints = target_programs * _TILE_M_MAX * _TILE_N_MAX
+    split_k = _resolve_split_k(
+        sk_num_pid_m, num_k_tiles, int_bits, M, N, K, a.dtype, scratch_ints,
+    )
 
     if split_k == 1:
         # Fast path: NUM_SMS is constexpr per GPU so it compiles once. Once the
@@ -713,9 +692,9 @@ def gemm_fxp_run(
     c_int = c_int_flat[: M * N].view(M, N)
     locks = locks_flat[:sk_num_tiles_mn]
     # Right-size the grid to actual tiles (idle programs still cost launch
-    # latency). split-K only triggers when num_tiles_mn < num_sms, so
-    # num_tiles_mn * split_k is roughly num_sms. NUM_SMS stays constexpr=target
-    # so the stride is fixed (no recompile on grid changes).
+    # latency); the split-K path is only reached for shapes warmup measured it
+    # worth, where tiles_mn * split_k stays near num_sms. NUM_SMS stays
+    # constexpr=target so the stride is fixed (no recompile on grid changes).
     grid_size = min(target_programs, sk_num_tiles_mn * split_k)
     grid = (grid_size,)
     _gemm_splitk_kernel[grid](
@@ -758,3 +737,69 @@ def gemm_fxp_run(
         num_stages=sk_num_stages,
     )
     return c
+
+
+# Warmup-time split-K autotuning. A few discarded runs to settle/JIT, then the
+# min over a handful of timed runs (the fastest is the cleanest read).
+_AUTOTUNE_WARMUP = 3
+_AUTOTUNE_ITERS = 15
+_AUTOTUNE_MAX_PID = 16   # probe up to M = 16*BLOCK_M (1024); split rarely helps
+                         # past that and the scratch buffer caps it anyway
+
+
+def autotune_split_k(
+    weight_native: torch.Tensor, int_bits: int, frac_bits: int
+) -> int:
+    """Time persistent vs two-way split for this (K, N) weight at each split-K
+    row-tile count and cache the faster one in _SPLITK_CHOICE. Called from warmup
+    once the persistent configs are compiled. Both paths give the same bits, so
+    this only changes speed, never the output. int16 and single-K-tile shapes
+    can't split and stay persistent. Returns how many tile counts went to
+    split-K."""
+    global _SPLITK_FORCE
+    if int_bits == 16:
+        return 0
+    K, N = weight_native.shape
+    dtype = weight_native.dtype
+    device = weight_native.device
+    num_k_tiles = triton.cdiv(K, _BLOCK_K_BY_DTYPE[dtype])
+    if num_k_tiles < 2:
+        return 0
+    num_sms = _device_sm_count(device)
+    scratch_ints = num_sms * _BLOCKS_PER_SM * _TILE_M_MAX * _TILE_N_MAX
+    sk_block_m = _CFG_SPLITK[0]
+
+    def _best_us(a: torch.Tensor) -> float:
+        for _ in range(_AUTOTUNE_WARMUP):
+            gemm_fxp_run(a, weight_native, None, int_bits, frac_bits)
+        torch.cuda.synchronize(device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        best = float("inf")
+        for _ in range(_AUTOTUNE_ITERS):
+            start.record()
+            gemm_fxp_run(a, weight_native, None, int_bits, frac_bits)
+            end.record()
+            end.synchronize()
+            best = min(best, start.elapsed_time(end))
+        return best
+
+    routed = 0
+    for pid_m in range(1, _AUTOTUNE_MAX_PID + 1):
+        M = pid_m * sk_block_m
+        if M * N > scratch_ints:   # split-2's scratch wouldn't fit beyond here
+            break
+        a = torch.zeros(M, K, device=device, dtype=dtype)
+        try:
+            _SPLITK_FORCE = 1
+            t_persistent = _best_us(a)
+            _SPLITK_FORCE = _SPLITK_SPLIT
+            t_split = _best_us(a)
+        finally:
+            _SPLITK_FORCE = None
+        # Record the measured winner either way. Ties go to persistent (identical
+        # output, so the tie-break is free).
+        use_split = t_split < t_persistent
+        _SPLITK_CHOICE[(pid_m, N, K, dtype, int_bits)] = _SPLITK_SPLIT if use_split else 1
+        routed += int(use_split)
+    return routed

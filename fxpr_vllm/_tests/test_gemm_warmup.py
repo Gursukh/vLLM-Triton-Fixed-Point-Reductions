@@ -1,54 +1,60 @@
-import pytest
 import torch
 
+from fxpr_vllm._triton import gemm
 from fxpr_vllm._triton.gemm import (
     _CFG_SPLITK,
     _M_BUCKETS,
     _PICKED_CONFIG,
     _gemm_kernel_autotuned,
-    _pick_split_k,
-    _reachable_split_ks,
+    _resolve_split_k,
 )
 from fxpr_vllm.warmup import _gemm_warmed, warmup_gemm
 
 from .fixed_point_helpers import requires_cuda, skip_if_dtype_unsupported
 
 
-def _splitk_from_M(M: int, N: int, K: int, dtype: torch.dtype, num_sms: int, int_bits: int) -> int:
-    """Same split-K math gemm_fxp_run runs, but for a single M."""
-    from fxpr_vllm._triton.gemm import _BLOCK_K_BY_DTYPE
-    sk_block_m, sk_block_n = _CFG_SPLITK[0], _CFG_SPLITK[1]
-    block_k = _BLOCK_K_BY_DTYPE[dtype]
-    num_k_tiles = (K + block_k - 1) // block_k
-    num_tiles_mn = ((M + sk_block_m - 1) // sk_block_m) * ((N + sk_block_n - 1) // sk_block_n)
-    return _pick_split_k(num_tiles_mn, num_k_tiles, num_sms, int_bits, M)
+def test_resolve_split_k_uses_cache_then_persistent():
+    """The runtime split decision reads the warmup-measured cache, honours a
+    forced override, and clamps on int16 / K-tiles / scratch. An un-probed shape
+    stays persistent. No GPU needed."""
+    dtype = torch.bfloat16
+    key = (3, 4096, 14336, dtype, 32)  # (sk_pid_m, N, K, dtype, int_bits)
+    big = 10**12  # scratch large enough not to bind
+    saved = dict(gemm._SPLITK_CHOICE)
+    try:
+        gemm._SPLITK_FORCE = None
+        gemm._SPLITK_CHOICE.clear()
 
+        # cached split-2 is used as-is
+        gemm._SPLITK_CHOICE[key] = 2
+        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, big) == 2
 
-def test_reachable_split_ks_round_trip():
-    """Sweep every M in the bucket range and check the split_k it picks is one
-    _reachable_split_ks reported. A miss here means warmup would skip a binary."""
-    cases = [
-        (64, 4096, torch.float16, 108, 32),    # A100-ish, tall-skinny
-        (4096, 4096, torch.float16, 108, 32),  # square, prefill
-        (128, 8192, torch.bfloat16, 132, 32),  # H100-ish
-        (64, 2048, torch.float16, 132, 16),    # int16, forces split_k=1
-        (4096, 14336, torch.bfloat16, 108, 32),  # A100, down_proj
-        (4096, 14336, torch.bfloat16, 188, 32),  # Blackwell, down_proj
-    ]
-    for N, K, dtype, num_sms, int_bits in cases:
-        reachable = _reachable_split_ks(N, K, dtype, num_sms, int_bits)
-        for M in range(1, _M_BUCKETS[-1] + 1):
-            s = _splitk_from_M(M, N, K, dtype, num_sms, int_bits)
-            assert s in reachable, (
-                f"M={M} produced split_k={s} not in reachable set {sorted(reachable)} "
-                f"for (N={N}, K={K}, dtype={dtype}, num_sms={num_sms}, int_bits={int_bits})"
-            )
+        # cached persistent is honoured
+        gemm._SPLITK_CHOICE[key] = 1
+        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, big) == 1
 
+        # a forced value beats the cache (this is how warmup times each path)
+        gemm._SPLITK_FORCE = 2
+        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, big) == 2
+        gemm._SPLITK_FORCE = None
 
-def test_reachable_split_ks_int16_is_only_one():
-    """int_bits=16 has no atomic, so _pick_split_k always returns 1."""
-    reachable = _reachable_split_ks(64, 4096, torch.float16, 108, 16)
-    assert set(reachable.keys()) == {1}
+        # int16 never splits, regardless of cache
+        assert _resolve_split_k(3, 112, 16, 192, 4096, 14336, dtype, big) == 1
+
+        # scratch too small for M*N -> persistent
+        gemm._SPLITK_CHOICE[key] = 2
+        assert _resolve_split_k(3, 112, 32, 192, 4096, 14336, dtype, 1) == 1
+
+        # fewer K-tiles than the split count -> persistent
+        assert _resolve_split_k(3, 1, 32, 192, 4096, 14336, dtype, big) == 1
+
+        # un-probed tile count (empty cache) -> persistent
+        gemm._SPLITK_CHOICE.clear()
+        assert _resolve_split_k(1, 112, 32, 64, 4096, 14336, dtype, big) == 1
+    finally:
+        gemm._SPLITK_FORCE = None
+        gemm._SPLITK_CHOICE.clear()
+        gemm._SPLITK_CHOICE.update(saved)
 
 
 @requires_cuda
